@@ -1,6 +1,6 @@
 import pandas as pd
 import polaris as po
-from egfr_binder_expression import DATA_DIR
+from egfr_binder_rd2 import DATA_DIR
 
 from sklearn.model_selection import StratifiedShuffleSplit, train_test_split, GroupShuffleSplit
 import numpy as np
