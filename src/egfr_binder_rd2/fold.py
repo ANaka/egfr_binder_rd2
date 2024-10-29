@@ -61,28 +61,39 @@ def generate_a3m_files(
     binder_sequences, 
     output_folder="/data/input_a3m", 
     template_a3m_path=MOUNTED_TEMPLATE_PATH,  # Updated default path
+    target_a3m_path=None,  # New optional parameter
     target_sequence=None
 ):
     os.makedirs(output_folder, exist_ok=True)
     
+    # Load template A3M
     with open(template_a3m_path, 'r') as template_file:
         template_lines = template_file.readlines()
     
-    # Extract the target sequence from the template if target_sequence is None
-    if target_sequence is None:
-        template_sequence = template_lines[2].strip()
-        binder_length = int(template_lines[0].split(',')[0].strip('#'))
-        target_sequence = template_sequence[binder_length:]
+    # Load target A3M if provided
+    if target_a3m_path:
+        with open(target_a3m_path, 'r') as target_file:
+            target_lines = target_file.readlines()
+        target_sequence = ''.join([line.strip() for line in target_lines if not line.startswith('#') and not line.startswith('>')])
+    else:
+        # Extract the target sequence from the template if target_sequence is None
+        if target_sequence is None:
+            template_sequence = template_lines[2].strip()
+            binder_length = int(template_lines[0].split(',')[0].strip('#'))
+            target_sequence = template_sequence[binder_length:]
     
     for name, binder_seq in binder_sequences.items():
         output_path = os.path.join(output_folder, f"{name}.a3m")
         
         with open(output_path, 'w') as output_file:
-            # Write the header lines
+            # Write the header lines from template
             output_file.writelines(template_lines[:2])
             
-            # Write the concatenated sequences
-            output_file.write(f"{binder_seq}{target_sequence}\n")
+            # Write the binder sequence (if provided) and target sequence
+            if binder_seq:
+                output_file.write(f"{binder_seq}{target_sequence}\n")
+            else:
+                output_file.write(f"{target_sequence}\n")
             
             # Write the rest of the template file
             output_file.writelines(template_lines[3:])
@@ -114,11 +125,12 @@ class LocalColabFold:
         os.environ["PATH"] = "/localcolabfold/colabfold-conda/bin:" + os.environ["PATH"]
 
     @method()
-    def fold(self, binder_sequences, template_a3m_path, target_sequence=None,  **kwargs):
+    def fold(self, binder_sequences, template_a3m_path, target_a3m_path=None, target_sequence=None,  **kwargs):
         input_path = generate_a3m_files(
             binder_sequences=binder_sequences,
             output_folder="/data/input_a3m",  # Using Volume path
             template_a3m_path=template_a3m_path,
+            target_a3m_path=target_a3m_path,  # Pass the target A3M path
             target_sequence=target_sequence
         )
         logger.info(f"Generated A3M files in: {input_path}")
@@ -178,8 +190,6 @@ class LocalColabFold:
         return {
             'binder': sequences.get('A', ''),
             'target': sequences.get('B', ''),
-            'binder_length': len(sequences.get('A', '')),
-            'target_length': len(sequences.get('B', '')),
         }
     
     @staticmethod
@@ -216,17 +226,27 @@ class LocalColabFold:
                     rank_match = re.search(r'rank_(\d+)', filename)
                     model_number = int(rank_match.group(1)) if rank_match else 0
                     
-                    binder_length = sequences.get('binder_length', 0)
-                    pae_interaction = (pae_array[binder_length:, :binder_length].mean() + pae_array[:binder_length, binder_length:].mean()) / 2 if pae_array.size else 0
+                    binder_seq = sequences.get('binder', '')
+                    binder_length = len(binder_seq)  # **Dynamic binder_length per result**
+                    target_length = len(sequences.get('target', ''))
+                    
+                    pae_interaction = 0
+                    if pae_array.size:
+                        # Ensure that the pae array dimensions accommodate dynamic binder lengths
+                        if pae_array.shape[0] >= binder_length and pae_array.shape[1] >= binder_length:
+                            pae_interaction = (pae_array[binder_length:, :binder_length].mean() + pae_array[:binder_length, binder_length:].mean()) / 2
+                        else:
+                            logger.warning(f"PAE array shape {pae_array.shape} does not match binder_length {binder_length}")
+                    
                     binder_plddt = plddt_array[:binder_length].mean() if plddt_array.size else 0
                     binder_pae = pae_array[:binder_length, :binder_length].mean() if pae_array.size else 0
                     
                     result = {
                         'seq_name': filename.split('_unrelaxed_rank')[0],
-                        'binder_sequence': sequences.get('binder', ''),
+                        'binder_sequence': binder_seq,
                         'target_sequence': sequences.get('target', ''),
-                        'binder_length': sequences.get('binder_length', 0),
-                        'target_length': sequences.get('target_length', 0),
+                        'binder_length': binder_length,
+                        'target_length': target_length,
                         'model_number': model_number,  # Use the safely extracted model number
                         'binder_plddt': float(binder_plddt),
                         'binder_pae': float(binder_pae),
@@ -252,6 +272,7 @@ class LocalColabFold:
 def fold_and_extract(
     binder_sequences: dict, 
     template_a3m_path: str = MOUNTED_TEMPLATE_PATH,  # Use the mounted path
+    target_a3m_path: str = None,  # New optional parameter
     target_sequence: str = None, 
     **kwargs
 ):
@@ -259,6 +280,7 @@ def fold_and_extract(
     result = lcf.fold.remote(
         binder_sequences=binder_sequences,
         template_a3m_path=template_a3m_path,
+        target_a3m_path=target_a3m_path,  # Pass the target A3M path
         target_sequence=target_sequence,
         **kwargs
     )
@@ -272,7 +294,8 @@ def fold_and_extract(
 def parallel_fold_and_extract(
     binder_sequences: dict, 
     template_a3m_path: str = None, 
-    target_sequence: str = None, 
+    target_a3m_path: str = None,  # New optional parameter
+    target_sequence: str = None,  # New optional parameter
     batch_size: int = 10,
     **kwargs
 ):
@@ -286,8 +309,8 @@ def parallel_fold_and_extract(
     batches = []
     for i in range(0, len(binder_sequences), batch_size):
         batch = dict(list(binder_sequences.items())[i:i+batch_size])
-        batches.append((batch, template_a3m_path, target_sequence))
-
+        batches.append((batch, template_a3m_path, target_a3m_path, target_sequence))
+    
     all_results = []
     for result in lcf.fold.starmap(batches, kwargs=kwargs):
         all_results.extend(result)
@@ -298,12 +321,14 @@ def parallel_fold_and_extract(
 def test():
     # Use the mounted template path
     template_a3m_path = MOUNTED_TEMPLATE_PATH
+    target_a3m_path = "/root/templates/custom_target.a3m"  # Example target A3M path
     binder_sequences = {
         "binder1": EGFS,
     }
     target_sequence = EGFR
     results_a3m_with_target = fold_and_extract.remote(
         template_a3m_path=template_a3m_path,
+        target_a3m_path=target_a3m_path,  # Pass the target A3M path
         binder_sequences=binder_sequences,
         target_sequence=target_sequence,
         num_recycle=1,
@@ -333,11 +358,7 @@ def manual_parallel_fold():
     seed = 'PSYSGCPSSYDGYCGNGGVCMHIESLDSYTCQCVIGYSGDRVQTRDLRWT'
     seed = 'ISYSACPLSYDGVCGNGGVCKHALSLDSYTCQCVWGYSGDRVQTRDLRYT'
 
-    mutations = [
-        # '5A',
-        # '6A',
-        
-        ]
+    mutations = []
     for pos in range(7, 50):
         mutations.append(f'{pos}A')
     seqs = {}
@@ -400,3 +421,7 @@ def quick_test():
     )
     
     print("Test Results:", results)
+
+
+
+
