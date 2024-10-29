@@ -10,3 +10,6 @@ wheels/
 .venv
 localcolabfold
 src/egfr_binder_rd2/data/colabfold_outputs/
+
+# Weights & Biases
+wandb/
