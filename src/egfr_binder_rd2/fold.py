@@ -14,7 +14,7 @@ from egfr_binder_rd2 import (
     EGFR, 
     COLABFOLD_GPU_CONCURRENCY_LIMIT, 
     FOLD_RESULTS_DIR, 
-    FOLD_RESULTS_VOLUME_NAME
+    MODAL_VOLUME_NAME
 )
 from egfr_binder_rd2.utils import get_mutation_diff, hash_seq
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 app = App("colabfold")
 
 # Initialize the Volume
-volume = Volume.from_name(FOLD_RESULTS_VOLUME_NAME, create_if_missing=True)
+volume = Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=True)
 
 # Create a mount for the template file
 template_mount = Mount.from_local_dir(
