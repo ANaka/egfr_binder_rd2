@@ -1,20 +1,23 @@
 import os
-import argparse
-import tempfile
-import shutil
 import subprocess
 import logging
-from egfr_binder_rd2 import TEMPLATE_A3M_PATH, EGFS, EGFR, COLABFOLD_GPU_CONCURRENCY_LIMIT, FOLD_RESULTS_DIR, FOLD_RESULTS_VOLUME_NAME
-from modal import Image, App, method, enter, Dict, Volume, Mount
-from egfr_binder_rd2.utils import get_mutation_diff, hash_seq
 import io
-import zipfile
 import re
 import json
 from datetime import datetime
-# from Bio import PDB  # Add this import at the module level
-# import numpy as np
-# import pandas as pd
+
+from modal import Image, App, method, enter, Dict, Volume, Mount
+
+from egfr_binder_rd2 import (
+    TEMPLATE_A3M_PATH, 
+    EGFS, 
+    EGFR, 
+    COLABFOLD_GPU_CONCURRENCY_LIMIT, 
+    FOLD_RESULTS_DIR, 
+    FOLD_RESULTS_VOLUME_NAME
+)
+from egfr_binder_rd2.utils import get_mutation_diff, hash_seq
+
 
 # Define constants for the modal volume path
 MODAL_VOLUME_PATH = "/data"
