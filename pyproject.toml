@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "biopython==1.81",
+    "ipykernel>=6.29.5",
+    "modal>=0.64.232",
+    "polaris-lib>=0.8.6",
+]
 
 [build-system]
 requires = ["hatchling"]
