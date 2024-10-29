@@ -1,6 +1,7 @@
 import hashlib
 from egfr_binder_rd2 import PEPMLM_RESULTS_DIR, FOLD_RESULTS_DIR
 import re
+import pandas as pd
 
 def hash_seq(sequence):
     """
