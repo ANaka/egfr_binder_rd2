@@ -137,6 +137,11 @@ class MSAQuery:
     def save_sequences_as_fasta(self, sequences: list[str]) -> Path:
         """Save sequences to a FASTA file, using sequence hashes as headers."""
         fasta_path = get_fasta_path(sequences)
+        fasta_path = Path(MODAL_VOLUME_PATH) / fasta_path
+        
+        # Create parent directories if they don't exist
+        fasta_path.parent.mkdir(parents=True, exist_ok=True)
+        
         # Write sequences to FASTA
         with open(fasta_path, "w") as f:
             for seq in sequences:

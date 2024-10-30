@@ -4,10 +4,11 @@ from pathlib import Path
 MSA_QUERY_HOST_URL = "https://api.colabfold.com"
 
 OUTPUT_DIRS = {
-    "a3m": Path("data/a3m/"),
-    "folded": Path("data/folded/"),
-    "fastas": Path("data/fastas/"),
-    "metrics_db": Path("metrics/metrics_db.json")
+    "a3m": Path("a3m/"),
+    "folded": Path("folded/"),
+    "fastas": Path("fastas/"),
+    "metrics_db": Path("metrics/metrics_db.json"),
+    "msa_results": Path("msa_results/")
 }
 
 LOGGING_CONFIG = {
