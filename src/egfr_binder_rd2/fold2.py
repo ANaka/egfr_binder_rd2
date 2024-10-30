@@ -111,9 +111,6 @@ class LocalColabFold:
             logger.error(f"Error output: {e.stderr}")
             raise
         
-        logger.info(f'input directory contents: {os.listdir(input_path)}')
-        logger.info(f"Output directory contents: {os.listdir(out_dir)}")
-        logger.info(f'current directory contents: {os.listdir(".")}')
 
     def extract_metrics(self, structure_path: Path) -> dict:
         """Extract folding metrics from the structure file."""
@@ -213,6 +210,12 @@ def fold(input_path) -> Path:
     
     logger.info(f"Starting folding for MSA results in {input_path}")
     return colabfold.colabfold_batch.remote(input_path, output_dir)
+
+@app.local_entrypoint()
+def test_fold():
+    """Test the folding functionality."""
+    fold.remote('msa_results/5b353a/5b353a.a3m')
+
 
 @app.local_entrypoint()
 def test_msa_server_query():
