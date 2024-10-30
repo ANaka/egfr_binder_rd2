@@ -46,21 +46,6 @@ def get_mutation_diff(seq1, seq2):
     
     return ",".join(mutations)
 
-def get_a3m_path(binder_seq: str, target_seq: str) -> Path:
-    """
-    Generate the file path for the A3M file based on the binder and target sequences.
-    
-    Args:
-        binder_seq (str): The binder protein sequence.
-        target_seq (str): The target protein sequence.
-    
-    Returns:
-        Path: The path to the A3M file.
-    """
-    binder_hash = hash_seq(binder_seq)
-    target_hash = hash_seq(target_seq)
-    filename = f"{binder_hash}_{target_hash}.a3m"
-    return OUTPUT_DIRS["a3m"] / filename
 
 def get_fasta_path(sequences: list[str]) -> Path:
     """
@@ -90,51 +75,75 @@ def get_folded_dir(binder_seq: str, target_seq: str) -> Path:
     target_hash = hash_seq(target_seq)
     return OUTPUT_DIRS["folded"] / f"{binder_hash}_{target_hash}"
 
-def initialize_metrics_db():
-    """
-    Initialize the metrics database by creating the necessary directories and the JSON file if they don't exist.
-    """
-    metrics_db_path = OUTPUT_DIRS["metrics_db"]
-    metrics_db_path.parent.mkdir(parents=True, exist_ok=True)
-    if not metrics_db_path.exists():
-        with open(metrics_db_path, "w") as f:
-            json.dump({}, f)
 
-def update_metrics_db(entry: dict):
+
+def parse_fasta_lines(lines):
     """
-    Update the metrics database with a new entry.
+    Parse FASTA-like lines into a dictionary of header:sequence pairs.
     
     Args:
-        entry (dict): The metrics entry to add.
-    """
-    metrics_db_path = OUTPUT_DIRS["metrics_db"]
-    if not metrics_db_path.exists():
-        raise FileNotFoundError(f"Metrics database not found at {metrics_db_path}")
-    
-    with open(metrics_db_path, "r") as f:
-        metrics_db = json.load(f)
-    
-    metrics_db[entry["id"]] = entry
-    
-    with open(metrics_db_path, "w") as f:
-        json.dump(metrics_db, f, indent=4)
-
-def get_metrics(entry_id: str) -> dict:
-    """
-    Retrieve metrics for a specific entry ID.
-    
-    Args:
-        entry_id (str): The unique identifier for the metrics entry.
-    
+        lines (list): List of strings containing FASTA format lines
+        
     Returns:
-        dict: The metrics entry if found, else an empty dictionary.
+        dict: Dictionary with headers as keys and sequences as values
     """
-    metrics_db_path = OUTPUT_DIRS["metrics_db"]
-    if not metrics_db_path.exists():
-        raise FileNotFoundError(f"Metrics database not found at {metrics_db_path}")
+    sequences = {}
+    current_header = None
+    current_sequence = []
     
-    with open(metrics_db_path, "r") as f:
-        metrics_db = json.load(f)
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        if line.startswith('>'):
+            # If we were building a sequence, save it
+            if current_header is not None:
+                sequences[current_header] = ''.join(current_sequence)
+                current_sequence = []
+            
+            # Start new sequence, store header without '>'
+            current_header = line[1:].split('\t')[0]  # Take first part before tab
+        else:
+            # Add sequence line
+            current_sequence.append(line)
     
-    return metrics_db.get(entry_id, {})
+    # Don't forget to save the last sequence
+    if current_header is not None:
+        sequences[current_header] = ''.join(current_sequence)
+    
+    return sequences
+
+def swap_binder_seq_into_a3m(
+    binder_seq, 
+    template_a3m_path,  # Updated default path
+    output_path=None,  # New optional parameter
+):
+    
+    # Load template A3M
+    with open(template_a3m_path, 'r') as template_file:
+        template_lines = template_file.readlines()
+    
+
+    template_sequence = template_lines[2].strip()
+    binder_length = int(template_lines[0].split(',')[0].strip('#'))
+    target_sequence = template_sequence[binder_length:]
+    
+    seq_dict = parse_fasta_lines(template_lines[3:])
+    seq_dict['101'] = binder_seq + ''.join(['-'] * len(target_sequence))
+
+    with open(output_path, 'w') as output_file:
+        # Write the header line from template
+        output_file.writelines(template_lines[0])
+        
+        # Write the binder sequence (if provided) and target sequence
+        output_file.write('>101\t102\n')
+        output_file.write(f"{binder_seq}{target_sequence}\n")
+        
+        for header, seq in seq_dict.items():
+            output_file.write(f">{header}\n")
+            output_file.write(f"{seq}\n")
+    
+    return output_path
+
 
