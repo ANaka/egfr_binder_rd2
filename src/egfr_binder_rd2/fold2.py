@@ -328,9 +328,21 @@ def get_a3m_path(binder_seq: str, target_seq: str) -> Path:
     timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
 )
-def fold_mutated_binder(binder_seq: str, parent_binder_seq: str, target_seq: str=EGFR) -> Path:
+def fold_binder(binder_seq: str, parent_binder_seq: str=None, target_seq: str=EGFR) -> Path:
     """Fold a mutated binder sequence."""
-    a3m_path = a3m_from_template.remote(binder_seq=binder_seq, parent_binder_seq=parent_binder_seq, target_seq=target_seq)
+
+    if parent_binder_seq is None:
+        a3m_path = get_a3m_path(binder_seq=binder_seq, target_seq=target_seq)
+
+    elif binder_seq == parent_binder_seq:
+        a3m_path = get_a3m_path(binder_seq=binder_seq, target_seq=target_seq)
+    else:
+        a3m_path = a3m_from_template.remote(binder_seq=binder_seq, parent_binder_seq=parent_binder_seq, target_seq=target_seq)
+
+    if not a3m_path.exists():
+        logger.error(f"MSA file not found at {a3m_path}")
+        raise FileNotFoundError(f"MSA file not found at {a3m_path}")
+
     return fold.remote(a3m_path)
 
 def get_metrics_from_hash(seq_hash: str) -> dict:
