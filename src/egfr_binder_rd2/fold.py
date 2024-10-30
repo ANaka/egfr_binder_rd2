@@ -178,6 +178,59 @@ class LocalColabFold:
         logger.info(f"Extracted {len(all_results)} results")
         
         return all_results
+    
+    @method()
+    def raw_fold(self, sequences,  **kwargs):
+        
+        # Create a temporary directory for the FASTA file
+        temp_dir = os.path.join(MODAL_VOLUME_PATH, "temp_fasta")
+        os.makedirs(temp_dir, exist_ok=True)
+        input_path = os.path.join(temp_dir, "sequences.fasta")
+
+        # Write sequences to FASTA file
+        with open(input_path, "w") as f:
+            for name, seq in sequences.items():
+                f.write(f">{name}\n{seq}\n")
+        
+        logger.info(f"Wrote sequences to temporary FASTA file: {input_path}")
+
+        out_dir = MODAL_VOLUME_PATH  # Using Volume path
+        os.makedirs(out_dir, exist_ok=True)
+        logger.info(f"Created output directory: {out_dir}")
+
+        cmd = ["colabfold_batch", input_path, out_dir]
+        
+        # Handle arguments
+        for key, value in kwargs.items():
+            key = key.replace('_', '-')
+            if isinstance(value, bool):
+                if value:
+                    cmd.append(f"--{key}")
+            elif value is not None:
+                cmd.extend([f"--{key}", str(value)])
+                
+        # Removed the zip flag
+        # cmd.append('--zip')
+        
+        logger.info(f"Running command: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info(f"Command output: {result.stdout}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Command failed with error: {e}")
+            logger.error(f"Error output: {e.stderr}")
+            raise
+        
+        logger.info(f'input directory contents: {os.listdir(input_path)}')
+        logger.info(f"Output directory contents: {os.listdir(out_dir)}")
+        logger.info(f'current directory contents: {os.listdir(".")}')
+        
+        # Directly process the output directory
+        all_results = self.extract_metrics_and_pdbs(out_dir)
+        logger.info(f"Extracted {len(all_results)} results")
+        
+        return all_results
 
     @staticmethod
     def extract_sequence_from_pdb(pdb_content):
@@ -291,6 +344,15 @@ def fold_and_extract(
         **kwargs
     )
     return result  # Now returns a list of results
+
+@app.function(
+    timeout=12800,
+    volumes={MODAL_VOLUME_PATH: volume},
+    mounts=[template_mount]
+)
+def raw_fold(input_path, **kwargs):
+    lcf = LocalColabFold()
+    return lcf.raw_fold.remote(input_path, **kwargs)
 
 @app.function(
     timeout=12800,
@@ -430,4 +492,18 @@ def quick_test():
 
 
 
+@app.local_entrypoint()
+def quick_test_raw():
+    s = 'SKEEEYYEEHQKLAKPVEELWEKLDELEKTGKLTGEHRPLVTEFRRLWSDAMVLIAMYMWYLEEVDKNPSEENRKKAQEYLEKVEEKKKEMEELLKKL'
 
+
+    binder_sequences = {
+        hash_seq(s): f'{s}:{EGFR}'
+    }
+
+    result = raw_fold.remote(
+        input_path=binder_sequences,
+        num_models=1, 
+        num_recycle=1,
+    )
+    print("Test Results:", result)
