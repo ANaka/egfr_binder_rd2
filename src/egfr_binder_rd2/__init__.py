@@ -7,8 +7,9 @@ OUTPUT_DIRS = {
     "a3m": Path("a3m/"),
     "folded": Path("folded/"),
     "fastas": Path("fastas/"),
-    "metrics_db": Path("metrics/metrics_db.json"),
-    "msa_results": Path("msa_results/")
+    "metrics_csv": Path("metrics.csv"),
+    "msa_results": Path("msa_results/"),
+    "lineage_csv": Path("lineage.csv"),
 }
 
 LOGGING_CONFIG = {
@@ -35,7 +36,8 @@ EGFR = ('LEEKKVCQGTSNKLTQLGTFEDHFLSLQRMFNNCEVVLGNLEITYVQRNYDLSFLKTIQEVA'
         'LEGEPREFVENSECIQCHPECLPQAMNITCTGRGPDNCIQCAHYIDGPHCVKTCPAGVMGENNTL'
         'VWKYADAGHVCHLCHPNCTYGCTGPGLRGCPTNGHHHHHH')
 
-COLABFOLD_GPU_CONCURRENCY_LIMIT = 80
+# COLABFOLD_GPU_CONCURRENCY_LIMIT = 80
+COLABFOLD_GPU_CONCURRENCY_LIMIT = 2
 
 # Volume Name
 MODAL_VOLUME_NAME = "egfr_binders"
