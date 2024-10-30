@@ -86,6 +86,9 @@ class LocalColabFold:
 
     @method()
     def colabfold_batch(self, input_path, out_dir, **kwargs):
+        # Convert Path objects to strings
+        input_path = str(input_path)
+        out_dir = str(out_dir)
 
         cmd = ["colabfold_batch", input_path, out_dir]
         
@@ -185,10 +188,31 @@ class MSAQuery:
         """Run complete MSA generation pipeline."""
         fasta_path = self.save_sequences_as_fasta.remote(sequences)
         logger.info(f"Created FASTA file at: {fasta_path}")
-        out_dir = OUTPUT_DIRS["msa_results"] / fasta_path.stem
+        
+        out_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"] / fasta_path.stem 
+        
         out_dir.mkdir(parents=True, exist_ok=True)
         result_dir = self.query_msa_server.remote(fasta_path, out_dir)
         return result_dir
+
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def fold(input_path) -> Path:
+    """Run folding on a directory containing MSA results."""
+    # Ensure paths are within Modal volume
+    input_path = Path(MODAL_VOLUME_PATH) / input_path
+    output_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    
+    # Create output directory if it doesn't exist
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    
+    colabfold = LocalColabFold()
+    
+    logger.info(f"Starting folding for MSA results in {input_path}")
+    return colabfold.colabfold_batch.remote(input_path, output_dir)
 
 @app.local_entrypoint()
 def test_msa_server_query():
