@@ -108,6 +108,50 @@ def get_latest_adapter(base_path: Path, yvar: str, transform_type: str) -> Path:
     adapter_files.sort(key=lambda x: x.stem.split('_')[-1], reverse=True)
     return adapter_files[0]
 
+def create_experts(expert_configs: Optional[List[ExpertConfig]], device: str) -> List[Any]:
+    """Create multiple experts based on configurations.
+    
+    Args:
+        expert_configs: List of expert configurations
+        device: Device to run the experts on ('cuda' or 'cpu')
+        
+    Returns:
+        List of initialized experts
+    """
+    # Use default configuration if none provided
+    if expert_configs is None:
+        expert_configs = [
+            ExpertConfig(
+                type=ExpertType.ESM,
+                weight=1.0,
+                temperature=1.0,
+            ),
+            ExpertConfig(
+                type=ExpertType.iPAE,
+                weight=1.0,
+                temperature=1.0,
+                make_negative=True,
+                transform_type="rank",
+            ),
+        ]
+    
+    # Create experts
+    experts = []
+    for config in expert_configs:
+        try:
+            expert = create_expert(config, device)
+            if config.weight != 1.0:
+                expert = evo_prot_grad.WeightedExpert(expert, config.weight)
+            experts.append(expert)
+        except Exception as e:
+            logger.warning(f"Failed to create expert {config.type}: {e}")
+            continue
+    
+    if not experts:
+        raise ValueError("No experts could be created!")
+    
+    return experts
+
 @app.function(
     image=image,
     gpu="A100",
@@ -246,87 +290,85 @@ def train_bt_model(
 
 @app.function(
     image=image,
-    gpu="A10G",
+    gpu="A100",
     timeout=3600,
     volumes={MODAL_VOLUME_PATH: volume},
     secrets=[wandb_secret],
 )
 def sample_sequences(
-    sequence: str,
+    sequences: List[str],                   # List of starting sequences
     expert_configs: Optional[List[ExpertConfig]] = None,
-    n_chains: int = 4,
-    n_steps: int = 250,
-    max_mutations: int = 5,
-    seed: int = 42,
-) -> list[str]:
-    """Sample sequences using EvoProtGrad with multiple experts."""
+    n_parallel_chains: int = 32,             # Number of parallel chains per sequence per run
+    n_serial_chains: int = 1,               # Number of sequential runs per sequence
+    n_steps: int = 250,                     # Steps per chain
+    max_mutations: int = -1,                 # Max mutations per sequence
+    seed: int = 42,                         # Random seed
+) -> pd.DataFrame:
+    """Sample sequences using EvoProtGrad with multiple experts and serial chains.
+    
+    Args:
+        sequences: List of starting sequences
+        expert_configs: List of expert configurations
+        n_parallel_chains: Number of parallel chains per sequence per run
+        n_serial_chains: Number of sequential runs per sequence
+        n_steps: Number of steps per chain
+        max_mutations: Maximum mutations allowed per sequence
+        seed: Random seed
+    """
     # Set random seeds
     torch.manual_seed(seed)
     torch.set_float32_matmul_precision('high')
     
-    # Use default configuration if none provided
-    if expert_configs is None:
-        expert_configs = [
-            ExpertConfig(
-                type=ExpertType.ESM,
-                weight=1.0,
-                temperature=1.0,
-            ),
-            ExpertConfig(
-                type=ExpertType.iPAE,
-                weight=1.0,
-                temperature=1.0,
-                make_negative=True,
-                transform_type="rank",
-            ),
-        ]
-    
+    # Initialize experts (same as before)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    experts = create_experts(expert_configs, device)
     
-    # Create experts
-    experts = []
-    for config in expert_configs:
-        try:
-            expert = create_expert(config, device)
-            if config.weight != 1.0:
-                expert = evo_prot_grad.WeightedExpert(expert, config.weight)
-            experts.append(expert)
-        except Exception as e:
-            logger.warning(f"Failed to create expert {config.type}: {e}")
-            continue
-    
-    if not experts:
-        raise ValueError("No experts could be created!")
-    
-    # Run directed evolution
-    variants, scores = evo_prot_grad.DirectedEvolution(
-        wt_protein=sequence,
-        output="all",
-        experts=experts,
-        parallel_chains=n_chains,
-        n_steps=n_steps,
-        max_mutations=max_mutations,
-        verbose=False,
-    )()
-    
-    # Process results
+    # Initialize results storage
     results = []
-    for chain in range(scores.shape[1]):
-        for step in range(scores.shape[0]):
-            seq = "".join(variants[step][chain].split(" "))
-            score = float(scores[step, chain])
-            results.append({
-                "sequence": seq,
-                "score": score,
-                "chain": chain,
-                "step": step,
-            })
+    total_chains = 0
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    
+    # Process each starting sequence
+    for seq_idx, sequence in enumerate(sequences):
+        logger.info(f"Processing sequence {seq_idx + 1}/{len(sequences)}: {sequence}")
+        
+        # Run serial chains for this sequence
+        for serial_idx in range(n_serial_chains):
+            logger.info(f"Running serial chain {serial_idx + 1}/{n_serial_chains} for sequence {seq_idx + 1}")
+            
+            # Run directed evolution
+            variants, scores = evo_prot_grad.DirectedEvolution(
+                wt_protein=sequence,
+                output="all",
+                experts=experts,
+                parallel_chains=n_parallel_chains,
+                n_steps=n_steps,
+                max_mutations=max_mutations,
+                verbose=False,
+            )()
+            
+            # Process results
+            for chain in range(scores.shape[1]):
+                for step in range(scores.shape[0]):
+                    seq = "".join(variants[step][chain].split(" "))
+                    score = float(scores[step, chain])
+                    results.append({
+                        "run": timestamp,
+                        "parent_idx": seq_idx,
+                        "parent_seq": sequence,
+                        "chain": total_chains,
+                        "step": step,
+                        "score": score,
+                        "sequence": seq,
+                    })
+                total_chains += 1
     
     # Convert to DataFrame, remove duplicates, and sort by score
     df = pd.DataFrame(results)
     df = df.drop_duplicates(subset=['sequence'])
     df = df.sort_values('score', ascending=False)
     
+    logger.info(f"Generated {len(df)} unique sequences across {total_chains} chains")
     return df
 
 @app.local_entrypoint()
@@ -344,17 +386,15 @@ def main():
             temperature=1.0,
             make_negative=True,
         ),
-        # ExpertConfig(
-        #     type=ExpertType.PTM,
-        #     weight=0.5,
-        #     temperature=1.0,
-        #     make_negative=True,
-        # ),
     ]
     
     sequences = sample_sequences.remote(
         sequence="AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS",
         expert_configs=expert_configs,
+        n_parallel_chains=32,           # Run 32 parallel chains
+        n_serial_chains=8,             # Run 8 times sequentially
+        n_steps=50,                    # 50 steps per chain
+        max_mutations=4,               # Max 4 mutations per sequence
     )
     print(f"Generated {len(sequences)} sequences")
 
