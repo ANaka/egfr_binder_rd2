@@ -456,23 +456,23 @@ def main():
     # Define multiple parent sequences
     parent_binder_seqs = [
        'AERMRRRFESIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS'
-    ] * 5
+    ] * 10
     
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
         generations=40,
-        n_to_fold=10,                # Total sequences to fold per generation
+        n_to_fold=50,                # Total sequences to fold per generation
         num_parents=10,               # Number of parents to keep
         top_k=50,                    # Top sequences to consider
         n_parallel_chains=16,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
-        n_steps=100,                  # Steps per chain
+        n_steps=200,                  # Steps per chain
         max_mutations=-1,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.2,
         parent_selection_temperature=2.0,
         sequence_sampling_temperature=2.0,
-        retrain_frequency=10,
+        retrain_frequency=2,
         seed=42,
         select_from_current_gen_only=False,  # Add this parameter
     )
