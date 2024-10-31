@@ -28,6 +28,10 @@ import numpy as np
 import pandas as pd
 import re
 
+
+EGFR_EPITOPE_RESIDUES = [11, 12, 13, 15, 16, 17, 18, 356, 440, 441]
+INTERACTION_CUTOFF = 4.0  # Angstroms
+
 # Define constants for the modal volume path
 MODAL_VOLUME_PATH = "/colabfold_data"
 
@@ -58,6 +62,9 @@ with image.imports():
     from Bio import PDB
     import numpy as np
     import pandas as pd
+    from Bio.PDB import PDBParser, NeighborSearch
+    from Bio.PDB import Selection
+    from Bio.PDB.Polypeptide import is_aa
 
 
 @app.cls(
@@ -345,6 +352,31 @@ def fold_binder(binder_seq: str, parent_binder_seq: str=None, target_seq: str=EG
 
     return fold.remote(a3m_path)
 
+
+def calc_percentage_charged(sequence: str) -> float:
+    """Calculate the percentage of charged amino acids in a sequence.
+    
+    Args:
+        sequence: Amino acid sequence string
+        
+    Returns:
+        float: Fraction of sequence that is charged (R,K,H,D,E)
+    """
+    charged = set('RKHDE')
+    return sum(1 for aa in sequence if aa in charged) / len(sequence)
+
+def calc_percentage_hydrophobic(sequence: str) -> float:
+    """Calculate the percentage of hydrophobic amino acids in a sequence.
+    
+    Args:
+        sequence: Amino acid sequence string
+        
+    Returns:
+        float: Fraction of sequence that is hydrophobic (V,I,L,M,F,Y,W)
+    """
+    hydrophobic = set('VILMFYW')
+    return sum(1 for aa in sequence if aa in hydrophobic) / len(sequence)
+
 def get_metrics_from_hash(seq_hash: str) -> dict:
     """Extract metrics from folding results for a given sequence hash."""
     folded_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
@@ -395,16 +427,28 @@ def get_metrics_from_hash(seq_hash: str) -> dict:
                         pae_array[:binder_length, binder_length:].mean()
                     ) / 2)
             
+            # Add epitope interaction analysis
+            parser = PDB.PDBParser(QUIET=True)
+            structure = parser.get_structure("protein", pdb_path)
+            
+            # Add sequence property metrics for the binder
+            binder_charged_fraction = calc_percentage_charged(binder_seq)
+            binder_hydrophobic_fraction = calc_percentage_hydrophobic(binder_seq)
+            
             results.append({
                 'seq_hash': seq_hash,
                 'binder_sequence': binder_seq,
+                'binder_length': binder_length,
                 'target_sequence': sequences.get('target', ''),
+                'target_length': target_length,
                 'model_number': model_number,
                 'binder_plddt': binder_plddt,
                 'binder_pae': binder_pae,
                 'pae_interaction': pae_interaction,
                 'ptm': data.get('ptm', 0),
                 'i_ptm': data.get('iptm', 0),
+                'binder_charged_fraction': binder_charged_fraction,
+                'binder_hydrophobic_fraction': binder_hydrophobic_fraction
             })
     
     return results
@@ -440,7 +484,7 @@ def update_metrics_for_all_folded():
     
     if not new_hashes:
         logger.info("No new sequences to process")
-        return metrics_file
+        return existing_df  # Return existing DataFrame instead of file path
     
     # Process new hashes
     new_results = []
@@ -464,6 +508,7 @@ def update_metrics_for_all_folded():
         logger.info(f"Added metrics for {len(new_results)} new models, total {len(df)} entries")
     else:
         logger.info("No new valid results to add")
+        df = existing_df  # Use existing DataFrame if no new results
     
     return df
 
