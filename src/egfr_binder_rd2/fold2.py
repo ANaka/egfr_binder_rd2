@@ -388,21 +388,23 @@ def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[st
     elif parent_binder_seqs is not None and len(parent_binder_seqs) == 1:
         parent_binder_seqs = parent_binder_seqs * len(binder_seqs)
     
-    # Handle case where no parent sequences are provided
+    # First, ensure we have MSAs for all sequences
     if parent_binder_seqs is None:
-        a3m_paths = [get_a3m_path(binder_seq=seq, target_seq=target_seq) for seq in binder_seqs]
+        # Generate new MSAs if no parent sequences
+        a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
     else:
-        # If parent sequences match binder sequences exactly, just get the a3m paths
+        # If parent sequences match binder sequences exactly, generate new MSAs
         if binder_seqs == parent_binder_seqs:
-            a3m_paths = [get_a3m_path(binder_seq=seq, target_seq=target_seq) for seq in binder_seqs]
+            a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
         else:
+            # Use template MSAs
             a3m_paths = a3m_from_template.remote(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
 
     # Check that all a3m files exist
     missing_files = [path for path in a3m_paths if not path.exists()]
     if missing_files:
-        logger.error(f"MSA files not found: {missing_files}")
-        raise FileNotFoundError(f"MSA files not found: {missing_files}")
+        logger.error(f"MSA files not found after generation attempt: {missing_files}")
+        raise FileNotFoundError(f"MSA generation failed for: {missing_files}")
 
     # Fold all sequences
     folded_paths = []
