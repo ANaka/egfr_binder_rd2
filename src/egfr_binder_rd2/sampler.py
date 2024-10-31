@@ -180,7 +180,7 @@ class DirectedEvolution:
             for parent_idx, parent_seq in enumerate(current_parent_seqs):
                 parent_variants = evoprotgrad_df[evoprotgrad_df['parent_seq'] == parent_seq]
                 if len(parent_variants) > 0:
-                    sampled_variants = self.sample_from_top_sequences(
+                    sampled_variants = self.sample_from_evoprotgrad_sequences(
                         parent_variants,
                         top_fraction=evoprotgrad_top_fraction,
                         sample_size=seqs_per_parent,
@@ -225,6 +225,10 @@ class DirectedEvolution:
                 logger.info("Calculating fitness using all historical sequences")
                 ranking_df = combined_df
                 logger.info(f"Using all {len(ranking_df)} historical sequences")
+
+            if len(ranking_df) == 0:
+                logger.warning("No sequences found for ranking. Using parent sequences for next generation.")
+                return current_parent_seqs
             
             # Calculate ranks and fitness
             ranking_df['pae_interaction_rank'] = 1 - ranking_df['pae_interaction'].rank(pct=True)
@@ -342,7 +346,7 @@ class DirectedEvolution:
         return df
 
     @staticmethod
-    def sample_from_top_sequences(df, top_fraction=0.25, sample_size=10, temperature=1.0):
+    def sample_from_evoprotgrad_sequences(df, top_fraction=0.25, sample_size=10, temperature=1.0):
         """
         Sample sequences from the top fraction based on scores.
         
@@ -395,7 +399,7 @@ class DirectedEvolution:
             str: Selected parent sequence
         """
         # Convert fitness scores to probabilities (lower is better)
-        scores = -df['fitness_score'].values  # Negative because lower fitness is better
+        scores = df['fitness'].values
         scores = scores / temperature  # Apply temperature scaling
         probabilities = np.exp(scores - np.max(scores))  # Subtract max for numerical stability
         probabilities = probabilities / probabilities.sum()
@@ -418,7 +422,7 @@ class DirectedEvolution:
             List[str]: Selected parent sequences
         """
         # Convert fitness scores to probabilities (lower is better)
-        scores = -df['fitness_score'].values  # Negative because lower fitness is better
+        scores = df['fitness'].values
         scores = scores / temperature  # Apply temperature scaling
         probabilities = np.exp(scores - np.max(scores))  # Subtract max for numerical stability
         probabilities = probabilities / probabilities.sum()
@@ -444,11 +448,11 @@ def main():
         parent_binder_seqs=parent_binder_seqs,
         generations=4,
         n_to_fold=10,                # Total sequences to fold per generation
-        num_parents=5,               # Number of parents to keep
+        num_parents=10,               # Number of parents to keep
         top_k=50,                    # Top sequences to consider
-        n_parallel_chains=32,        # Parallel chains per sequence
+        n_parallel_chains=8,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
-        n_steps=250,                  # Steps per chain
+        n_steps=50,                  # Steps per chain
         max_mutations=-1,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.2,
         parent_selection_temperature=2.0,
