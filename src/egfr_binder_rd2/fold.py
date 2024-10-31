@@ -376,17 +376,14 @@ def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[st
     logger.info(f"Using parent sequences: {parent_binder_seqs}")
     
     # First, ensure we have MSAs for all sequences
-    if parent_binder_seqs is None:
-        logger.info("No parent sequences provided, generating new MSAs")
+
+    # If parent sequences match binder sequences exactly, generate new MSAs
+    if binder_seqs == parent_binder_seqs:
+        logger.info("Binder sequences match parent sequences, generating new MSAs")
         a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
     else:
-        # If parent sequences match binder sequences exactly, generate new MSAs
-        if binder_seqs == parent_binder_seqs:
-            logger.info("Binder sequences match parent sequences, generating new MSAs")
-            a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
-        else:
-            logger.info("Using template MSAs from parent sequences")
-            a3m_paths = a3m_from_template(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
+        logger.info("Using template MSAs from parent sequences")
+        a3m_paths = a3m_from_template(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
 
     logger.info(f"Generated a3m paths: {a3m_paths}")
     volume.commit()
@@ -717,5 +714,130 @@ def benchmark_fold():
     end_time = time.time()
     duration = end_time - start_time
     logger.info(f"Benchmark fold completed in {duration:.2f} seconds")
+
+    return result
+
+
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def parallel_fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[str, List[str]]=None, target_seq: str=EGFR) -> List[Path]:
+    """Fold multiple binder sequences in parallel."""
+    # Convert single sequences to lists for consistent handling
+    if isinstance(binder_seqs, str):
+        binder_seqs = [binder_seqs]
+    if isinstance(parent_binder_seqs, str):
+        parent_binder_seqs = [parent_binder_seqs] * len(binder_seqs)
+    elif parent_binder_seqs is not None and len(parent_binder_seqs) == 1:
+        parent_binder_seqs = parent_binder_seqs * len(binder_seqs)
+    
+    logger.info(f"Parallel folding {len(binder_seqs)} sequences")
+    
+
+    if binder_seqs == parent_binder_seqs:
+        logger.info("Binder sequences match parent sequences, generating new MSAs")
+        a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
+    else:
+        logger.info("Using template MSAs from parent sequences")
+        a3m_paths = a3m_from_template(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
+
+    volume.commit()
+    volume.reload()
+    
+    # Check that all a3m files exist
+    missing_files = [path for path in a3m_paths if not path.exists()]
+    if missing_files:
+        raise FileNotFoundError(f"MSA generation failed for: {missing_files}")
+
+    # Initialize ColabFold instance
+    colabfold = LocalColabFold()
+    output_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create list of arguments for each folding task
+    # Each item should be a tuple of (a3m_path, output_dir)
+    folding_args = [(a3m_path, output_dir) for a3m_path in a3m_paths]
+    kwargs = {"num_models": 1, "num_recycle": 1}
+
+    # Run folding in parallel using starmap since we have multiple arguments
+    all_metrics = []
+    for result in colabfold.colabfold_batch.starmap(folding_args, kwargs=kwargs):
+        logger.info(f"Completed folding task with result: {result}")
+        
+        # Process results for this batch
+        for a3m_path in a3m_paths:
+            seq_hash = a3m_path.stem
+            scores_files = list(output_dir.glob(f"{seq_hash}_scores*.json"))
+            
+            if not scores_files:
+                logger.error(f"No scores files found for {seq_hash}")
+                continue
+                
+            metrics = []
+            for scores_file in scores_files:
+                with open(scores_file, 'r') as f:
+                    data = json.load(f)
+                    
+                rank_match = re.search(r'rank_(\d+)', scores_file.name)
+                model_number = int(rank_match.group(1)) if rank_match else 0
+                
+                metrics.append({
+                    'seq_hash': seq_hash,
+                    'model_number': model_number,
+                    'plddt': np.mean(data.get('plddt', [])),
+                    'ptm': data.get('ptm', 0),
+                    'i_ptm': data.get('iptm', 0),
+                    'pae': np.mean(data.get('pae', [])) if data.get('pae') else None
+                })
+            
+            all_metrics.extend(metrics)
+    
+    return all_metrics
+
+def generate_mutated_sequences(parent_seq: str, num_sequences: int = 10) -> list:
+    import random
+    """Generate sequences with single random mutations from parent sequence.
+    
+    Args:
+        parent_seq: Parent sequence to mutate
+        num_sequences: Number of sequences to generate
+        
+    Returns:
+        List of mutated sequences
+    """
+    amino_acids = 'ACDEFGHIKLMNPQRSTVWY'  # Standard amino acids
+    sequences = []
+    
+    for _ in range(num_sequences):
+        # Choose random position to mutate
+        pos = random.randint(0, len(parent_seq) - 1)
+        
+        # Choose random amino acid different from original
+        original_aa = parent_seq[pos]
+        new_aa = random.choice(amino_acids.replace(original_aa, ''))
+        
+        # Create mutated sequence
+        mutated_seq = parent_seq[:pos] + new_aa + parent_seq[pos + 1:]
+        sequences.append(mutated_seq)
+    
+    return sequences
+
+@app.local_entrypoint()
+def benchmark_parallel_fold():
+    import time
+    logger.info("Starting parallel benchmark fold")
+    start_time = time.time()
+
+    parent_binder_seq = 'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS'
+    binder_seqs = generate_mutated_sequences(parent_binder_seq)
+
+    logger.info("Calling parallel_fold_binder")
+    result = parallel_fold_binder.remote(binder_seqs=binder_seqs, parent_binder_seqs=[parent_binder_seq])
+    
+    end_time = time.time()
+    duration = end_time - start_time
+    logger.info(f"Parallel benchmark fold completed in {duration:.2f} seconds")
 
     return result
