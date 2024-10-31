@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 from egfr_binder_rd2 import  OUTPUT_DIRS
+from egfr_binder_rd2 import EvolutionMetadata
 
 def hash_seq(sequence):
     """
@@ -145,5 +146,11 @@ def swap_binder_seq_into_a3m(
             output_file.write(f"{seq}\n")
     
     return output_path
+
+def load_evolution_metadata(metadata_file: Path) -> EvolutionMetadata:
+    """Load evolution metadata from a JSON file"""
+    with open(metadata_file, "r") as f:
+        data = json.load(f)
+    return EvolutionMetadata(**data)
 
 
