@@ -5,7 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 import tempfile
-from typing import List
+from typing import List, Union
 from modal import Image, App, method, enter, Dict, Volume, Mount, interact
 from egfr_binder_rd2 import (
     EGFS, 
@@ -216,17 +216,26 @@ class MSAQuery:
             raise
 
     @method()
-    def run_msa_generation(self, sequence: str) -> Path:
-        """Run complete MSA generation pipeline."""
-        fasta_path = self.save_sequences_as_fasta.remote([sequence])
+    def run_msa_generation(self, sequences: List[str]) -> List[Path]:
+        """Run complete MSA generation pipeline for multiple sequences.
+        
+        Args:
+            sequences: List of sequences to process (each can be single sequence or paired like 'seq1:seq2')
+            
+        Returns:
+            List of paths to generated MSA files
+        """
+        fasta_path = self.save_sequences_as_fasta.remote(sequences)
         logger.info(f"Created FASTA file at: {fasta_path}")
         
-        # Use a flat directory structure in msa_results
         out_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
-        
         out_dir.mkdir(parents=True, exist_ok=True)
+        
         result_dir = self.query_msa_server.remote(fasta_path, out_dir)
-        return result_dir
+        
+        # Return list of generated a3m files
+        a3m_files = list(Path(result_dir).glob("*.a3m"))
+        return a3m_files
 
 
 @app.function(
@@ -234,10 +243,19 @@ class MSAQuery:
     timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
 )
-def get_msa_for_binder(binder_seq: str, target_seq: str=EGFR) -> Path:
-    """Get the MSA results for a given binder sequence."""
+def get_msa_for_binder(binder_seqs: List[str], target_seq: str=EGFR) -> List[Path]:
+    """Get the MSA results for given binder sequences.
+    
+    Args:
+        binder_seqs: List of binder sequences to process
+        target_seq: Target sequence to pair with each binder
+        
+    Returns:
+        List of paths to generated MSA files
+    """
+    paired_seqs = [f'{binder}:{target_seq}' for binder in binder_seqs]
     msa = MSAQuery()
-    return msa.run_msa_generation.remote(f'{binder_seq}:{target_seq}')
+    return msa.run_msa_generation.remote(paired_seqs)
 
 
 
@@ -271,63 +289,78 @@ def test_fold():
 def test_msa_server_query():
     """Test the MSA server query functionality."""
     test_sequences = [
-        f'{EGFS}:{EGFR}'
+        f'{EGFS}:{EGFR}',
+        # Add more test sequences as needed
     ]
 
     msa = MSAQuery()
-    result_dir = msa.run_msa_generation.remote(test_sequences)
-    print(f"MSA results saved to: {result_dir}")
+    result_files = msa.run_msa_generation.remote(test_sequences)
+    print(f"MSA results saved to: {[str(p) for p in result_files]}")
 
+def get_a3m_path(binder_seq: str, target_seq: str) -> Path:
+    seq_hash = hash_seq(f'{binder_seq}:{target_seq}')
+    return Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"] / f"{seq_hash}.a3m"
 
 @app.function(
     image=image,
     timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
 )
-def a3m_from_template(binder_seq: str, parent_binder_seq: str, target_seq: str=EGFR) -> Path:
-    """Get the a3m file path for a given binder sequence."""
-    assert len(binder_seq) == len(parent_binder_seq), "Binder sequences must be the same length"
+def a3m_from_template(binder_seqs: List[str], parent_binder_seqs: List[str], target_seq: str=EGFR) -> List[Path]:
+    """Get the a3m file paths for given binder sequences using their parent sequences as templates.
     
-    a3m_path = get_a3m_path(binder_seq=binder_seq, target_seq=target_seq)
-    lineage_json_path = a3m_path.with_suffix('.lineage.json')
+    Args:
+        binder_seqs: List of binder sequences to process
+        parent_binder_seqs: List of parent sequences to use as templates (must match length of binder_seqs)
+        target_seq: Target sequence to pair with each binder
+        
+    Returns:
+        List of paths to generated a3m files
+    """
+    assert len(binder_seqs) == len(parent_binder_seqs), "Must provide same number of binder and parent sequences"
+    result_paths = []
     
-    if a3m_path.exists():
-        logger.info(f"Found existing MSA at {a3m_path}")
-        if not lineage_json_path.exists():
+    for binder_seq, parent_binder_seq in zip(binder_seqs, parent_binder_seqs):
+        assert len(binder_seq) == len(parent_binder_seq), "Binder and parent sequences must be the same length"
+        
+        a3m_path = get_a3m_path(binder_seq=binder_seq, target_seq=target_seq)
+        lineage_json_path = a3m_path.with_suffix('.lineage.json')
+        
+        if a3m_path.exists():
+            logger.info(f"Found existing MSA at {a3m_path}")
+            if not lineage_json_path.exists():
+                # Record lineage information
+                lineage_info = {
+                    'seq_hash': hash_seq(f'{binder_seq}:{target_seq}'),
+                    'parent_hash': hash_seq(f'{parent_binder_seq}:{target_seq}'),
+                    'binder_seq': binder_seq,
+                    'parent_seq': parent_binder_seq,
+                    'target_seq': target_seq,
+                    'mutations': get_mutation_diff(parent_binder_seq, binder_seq),
+                    'timestamp': datetime.now().isoformat()
+                }
+                with open(lineage_json_path, 'w') as f:
+                    json.dump(lineage_info, f, indent=2)
+        else:
+            template_a3m_path = get_a3m_path(binder_seq=parent_binder_seq, target_seq=target_seq)
+            
             # Record lineage information
             lineage_info = {
                 'seq_hash': hash_seq(f'{binder_seq}:{target_seq}'),
                 'parent_hash': hash_seq(f'{parent_binder_seq}:{target_seq}'),
                 'binder_seq': binder_seq,
                 'parent_seq': parent_binder_seq,
-                'target_seq': target_seq,
                 'mutations': get_mutation_diff(parent_binder_seq, binder_seq),
                 'timestamp': datetime.now().isoformat()
             }
             with open(lineage_json_path, 'w') as f:
                 json.dump(lineage_info, f, indent=2)
-        return a3m_path
-    else:
-        template_a3m_path = get_a3m_path(binder_seq=parent_binder_seq, target_seq=target_seq)
+            
+            a3m_path = swap_binder_seq_into_a3m(binder_seq=binder_seq, template_a3m_path=template_a3m_path, output_path=a3m_path)
         
-        # Record lineage information
-        lineage_info = {
-            'seq_hash': hash_seq(f'{binder_seq}:{target_seq}'),
-            'parent_hash': hash_seq(f'{parent_binder_seq}:{target_seq}'),
-            'binder_seq': binder_seq,
-            'parent_seq': parent_binder_seq,
-            'mutations': get_mutation_diff(parent_binder_seq, binder_seq),
-            'timestamp': datetime.now().isoformat()
-        }
-        with open(lineage_json_path, 'w') as f:
-            json.dump(lineage_info, f, indent=2)
-        
-        return swap_binder_seq_into_a3m(binder_seq=binder_seq, template_a3m_path=template_a3m_path, output_path=a3m_path)
-
-
-def get_a3m_path(binder_seq: str, target_seq: str) -> Path:
-    seq_hash = hash_seq(f'{binder_seq}:{target_seq}')
-    return Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"] / f"{seq_hash}.a3m"
+        result_paths.append(a3m_path)
+    
+    return result_paths
 
 
 @app.function(
@@ -335,22 +368,45 @@ def get_a3m_path(binder_seq: str, target_seq: str) -> Path:
     timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
 )
-def fold_binder(binder_seq: str, parent_binder_seq: str=None, target_seq: str=EGFR) -> Path:
-    """Fold a mutated binder sequence."""
-
-    if parent_binder_seq is None:
-        a3m_path = get_a3m_path(binder_seq=binder_seq, target_seq=target_seq)
-
-    elif binder_seq == parent_binder_seq:
-        a3m_path = get_a3m_path(binder_seq=binder_seq, target_seq=target_seq)
+def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[str, List[str]]=None, target_seq: str=EGFR) -> List[Path]:
+    """Fold one or more mutated binder sequences.
+    
+    Args:
+        binder_seqs: Single binder sequence or list of sequences to fold
+        parent_binder_seqs: Optional parent sequence(s) to use as template(s)
+        target_seq: Target sequence to pair with each binder
+        
+    Returns:
+        List of paths to folded structure files
+    """
+    # Convert single sequences to lists for consistent handling
+    if isinstance(binder_seqs, str):
+        binder_seqs = [binder_seqs]
+    if isinstance(parent_binder_seqs, str):
+        parent_binder_seqs = [parent_binder_seqs]
+    
+    # Handle case where no parent sequences are provided
+    if parent_binder_seqs is None:
+        a3m_paths = [get_a3m_path(binder_seq=seq, target_seq=target_seq) for seq in binder_seqs]
     else:
-        a3m_path = a3m_from_template.remote(binder_seq=binder_seq, parent_binder_seq=parent_binder_seq, target_seq=target_seq)
+        # If parent sequences match binder sequences exactly, just get the a3m paths
+        if binder_seqs == parent_binder_seqs:
+            a3m_paths = [get_a3m_path(binder_seq=seq, target_seq=target_seq) for seq in binder_seqs]
+        else:
+            a3m_paths = a3m_from_template.remote(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
 
-    if not a3m_path.exists():
-        logger.error(f"MSA file not found at {a3m_path}")
-        raise FileNotFoundError(f"MSA file not found at {a3m_path}")
+    # Check that all a3m files exist
+    missing_files = [path for path in a3m_paths if not path.exists()]
+    if missing_files:
+        logger.error(f"MSA files not found: {missing_files}")
+        raise FileNotFoundError(f"MSA files not found: {missing_files}")
 
-    return fold.remote(a3m_path)
+    # Fold all sequences
+    folded_paths = []
+    for a3m_path in a3m_paths:
+        folded_paths.append(fold.remote(a3m_path))
+    
+    return folded_paths
 
 
 def calc_percentage_charged(sequence: str) -> float:
@@ -380,6 +436,21 @@ def calc_percentage_hydrophobic(sequence: str) -> float:
 def get_metrics_from_hash(seq_hash: str) -> dict:
     """Extract metrics from folding results for a given sequence hash."""
     folded_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    
+    # Add check for lineage information
+    msa_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
+    lineage_path = msa_dir / f"{seq_hash}.lineage.json"
+    
+    # Load lineage info if available
+    parent_info = {}
+    if lineage_path.exists():
+        with open(lineage_path, 'r') as f:
+            lineage_data = json.load(f)
+            parent_info = {
+                'parent_hash': lineage_data.get('parent_hash'),
+                'parent_sequence': lineage_data.get('parent_seq'),
+                'mutations': lineage_data.get('mutations')
+            }
     
     # Find relevant files
     base_pattern = f"{seq_hash}_*"
@@ -448,7 +519,10 @@ def get_metrics_from_hash(seq_hash: str) -> dict:
                 'ptm': data.get('ptm', 0),
                 'i_ptm': data.get('iptm', 0),
                 'binder_charged_fraction': binder_charged_fraction,
-                'binder_hydrophobic_fraction': binder_hydrophobic_fraction
+                'binder_hydrophobic_fraction': binder_hydrophobic_fraction,
+                'parent_hash': parent_info.get('parent_hash', None),
+                'parent_sequence': parent_info.get('parent_sequence', None),
+                'mutations': parent_info.get('mutations', None)
             })
     
     return results
