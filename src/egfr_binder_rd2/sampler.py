@@ -166,9 +166,9 @@ class DirectedEvolution:
             # Log statistics for this generation
             logger.info("Generation Statistics:")
             logger.info(f"Mean PLL: {combined_df['sequence_log_pll'].mean():.2f}")
-            logger.info(f"Mean PAE: {combined_df['pae_interaction'].mean():.2f}")
+            logger.info(f"Mean iPAE: {combined_df['pae_interaction'].mean():.2f}")
             logger.info(f"Best PLL: {combined_df['sequence_log_pll'].max():.2f}")
-            logger.info(f"Best PAE: {combined_df['pae_interaction'].min():.2f}")
+            logger.info(f"Best iPAE: {combined_df['pae_interaction'].min():.2f}")
 
             # Step 4: Select Top Performers based on fitness score
             logger.info(f"Selecting top {top_k} sequences based on fitness scores...")
