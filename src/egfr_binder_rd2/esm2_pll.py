@@ -5,11 +5,19 @@ from egfr_binder_rd2 import (
     EGFR, 
     COLABFOLD_GPU_CONCURRENCY_LIMIT, 
     MODAL_VOLUME_NAME,
-    MSA_QUERY_HOST_URL,
     OUTPUT_DIRS,
     LOGGING_CONFIG,
     MODAL_VOLUME_PATH
 )
+import json
+from pathlib import Path
+from egfr_binder_rd2.utils import hash_seq
+
+import logging
+
+# Set up logging using configuration
+logging.basicConfig(level=LOGGING_CONFIG["level"], format=LOGGING_CONFIG["format"])
+logger = logging.getLogger(__name__)
 
 # Define the container image with required dependencies
 image = (
@@ -17,19 +25,19 @@ image = (
     .pip_install(
         "torch",
         "transformers",
+        "pandas",
     )
 )
 
 app = modal.App("esm2-inference")
 volume = modal.Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=True)
 
-# Add these constants near the top with other constants
-ESM2_WEIGHTS_URL = "https://huggingface.co/mhcelik/esm-efficient/resolve/main/650M.safetensors?download=true"
-ESM2_WEIGHTS_PATH = f"{MODAL_VOLUME_PATH}/650M.safetensors"
 
 with image.imports():
     from transformers import AutoTokenizer, AutoModelForMaskedLM
     import torch
+    import pandas as pd
+    import numpy as np
 
 @app.cls(
     gpu="A10G",
@@ -95,18 +103,151 @@ class ESM2Model:
     volumes={MODAL_VOLUME_PATH: volume},
     )
 def process_sequences(sequences: List[str]):
-    model = ESM2Model()
-    return model.predict_batch.remote(sequences)
+    # Create output directory if it doesn't exist
+    results_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_pll_results']
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"Processing {len(sequences)} sequences")
+    logger.info(f"Results directory: {results_dir}")
+    
+    # Process only sequences that haven't been computed yet
+    sequences_to_process = []
+    cached_results = []
+    
+    for seq in sequences:
+        # Add 'seq_' prefix to distinguish from binder-target pair hashes
+        seq_hash = f"bdr_{hash_seq(seq)}"
+        result_path = results_dir / f"{seq_hash}.json"
+        
+        if result_path.exists():
+            logger.info(f"Found cached result for {seq_hash}")
+            # Load cached result
+            with open(result_path, 'r') as f:
+                cached_results.append(json.load(f))
+        else:
+            logger.info(f"Need to process sequence {seq_hash}")
+            sequences_to_process.append(seq)
+    
+    # Process new sequences if any
+    if sequences_to_process:
+        logger.info(f"Processing {len(sequences_to_process)} new sequences")
+        model = ESM2Model()
+        new_results = model.predict_batch.remote(sequences_to_process)
+        logger.info(f"Received predictions for {len(new_results)} sequences")
+        
+        # Add hash to results and save individually
+        for seq, result in zip(sequences_to_process, new_results):
+            seq_hash = f"bdr_{hash_seq(seq)}"
+            result['sequence_hash'] = seq_hash
+            
+            # Convert NumPy arrays to lists before saving
+            result['token_probabilities'] = result['token_probabilities'].tolist()
+            result['mask_consistent_probabilities'] = result['mask_consistent_probabilities'].tolist()
+            result['token_log_plls'] = result['token_log_plls'].tolist()
+            
+            # Save individual result
+            result_path = results_dir / f"{seq_hash}.json"
+            logger.info(f"Saving result to {result_path}")
+            with open(result_path, 'w') as f:
+                json.dump(result, f, indent=2)
+        
+        # Combine with cached results
+        all_results = cached_results + new_results
+        logger.info(f"Total results: {len(all_results)}")
+    else:
+        logger.info("No new sequences to process")
+        all_results = cached_results
+    
+    return all_results
 
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def update_pll_metrics():
+    """Update metrics CSV with results from all ESM2 PLL calculations, only processing new sequences."""
+    results_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_pll_results']
+    metrics_file = Path(MODAL_VOLUME_PATH) / 'esm2_pll_metrics.csv'
+    
+    # Create metrics directory if it doesn't exist
+    metrics_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load existing metrics if available
+    existing_df = pd.DataFrame()
+    existing_hashes = set()
+    if metrics_file.exists():
+        existing_df = pd.read_csv(metrics_file)
+        existing_hashes = set(existing_df['sequence_hash'].unique())
+        logger.info(f"Found existing metrics for {len(existing_hashes)} sequence hashes")
+    
+    # Get all JSON files in results directory
+    all_files = list(results_dir.glob("*.json"))
+    all_hashes = set(f.stem for f in all_files)
+    
+    # Identify new hashes that need processing
+    new_hashes = all_hashes - existing_hashes
+    logger.info(f"Found {len(new_hashes)} new sequence hashes to process")
+    
+    if not new_hashes:
+        logger.info("No new sequences to process")
+        return existing_df
+    
+    # Process new hashes
+    new_results = []
+    for seq_hash in new_hashes:
+        result_path = results_dir / f"{seq_hash}.json"
+        if result_path.exists():
+            with open(result_path, 'r') as f:
+                result = json.load(f)
+                
+            
+                
+                # Extract relevant metrics
+                metrics = {
+                    'sequence_hash': seq_hash,
+                    'sequence': result['sequence'],
+                    'sequence_length': result['sequence_length'],
+                    'normalized_log_pll': result['normalized_log_pll'],
+                    'sequence_log_pll': result['sequence_log_pll'],
+                    'mean_token_probability': float(np.mean(result['token_probabilities'])),
+                    'min_token_probability': float(np.min(result['token_probabilities'])),
+                }
+                new_results.append(metrics)
+    
+    if new_results:
+        # Convert new results to DataFrame
+        new_df = pd.DataFrame(new_results)
+        
+        # Combine with existing results
+        if not existing_df.empty:
+            df = pd.concat([existing_df, new_df], ignore_index=True)
+        else:
+            df = new_df
+        
+        # Save updated metrics
+        df.to_csv(metrics_file, index=False)
+        logger.info(f"Added metrics for {len(new_results)} new sequences, total {len(df)} entries")
+    else:
+        logger.info("No new valid results to add")
+        df = existing_df
+    
+    return df
+
+
+# @app.local_entrypoint()
+# def main():
+#     df = update_pll_metrics.remote()
+#     print(df)
 
 @app.local_entrypoint()
-def main():
+def test_run():
     binder_seqs = [
-        'WVQLQESGGGLVQPGGSLRLSCAASGRTFSSYAMGWFRQAPGKQREFVAAIRWSGGYTYYTDSVKGRFTISRDNAKTTVYLQMNSLKPEDTAVYYCAATYLSSDYSRYALPQRPLDYDYWGQGTQVTVSSLE:LEEKKVCQGTSNKLTQLGTFEDHFLSLQRMFNNCEVVLGNLEITYVQRNYDLSFLKTIQEVAGYVLIALNTVERIPLENLQIIRGNMYYENSYALAVLSNYDANKTGLKELPMRNLQEILHGAVRFSNNPALCNVESIQWRDIVSSDFLSNMSMDFQNHLGSCQKCDPSCPNGSCWGAGEENCQKLTKIICAQQCSGRCRGKSPSDCCHNQCAAGCTGPRESDCLVCRKFRDEATCKDTCPPLMLYNPTTYQMDVNPEGKYSFGATCVKKCPRNYVVTDHGSCVRACGADSYEMEEDGVRKCKKCEGPCRKVCNGIGIGEFKDSLSINATNIKHFKNCTSISGDLHILPVAFRGDSFTHTPPLDPQELDILKTVKEITGFLLIQAWPENRTDLHAFENLEIIRGRTKQHGQFSLAVVSLNITSLGLRSLKEISDGDVIISGNKNLCYANTINWKKLFGTSGQKTKIISNRGENSCKATGQVCHALCSPEGCWGPEPRDCVSCRNVSRGRECVDKCKLLEGEPREFVENSECIQCHPECLPQAMNITCTGRGPDNCIQCAHYIDGPHCVKTCPAGVMGENNTLVWKYADAGHVCHLCHPNCTYGCTGPGLRGCPTNGHHHHHH',
-        'QVQLQESGGGLVQPGGSLRLSCAASGRTFSSHAMGWFRQAPGKQREFVAAIRWSGGYTYYTDSVKGRFTISRDNAKTTVYLQMNSLKPEDTAVYYCAATYLSSDYSRYALPQRPLDYDYWGQGTQVTVSSLE:LEEKKVCQGTSNKLTQLGTFEDHFLSLQRMFNNCEVVLGNLEITYVQRNYDLSFLKTIQEVAGYVLIALNTVERIPLENLQIIRGNMYYENSYALAVLSNYDANKTGLKELPMRNLQEILHGAVRFSNNPALCNVESIQWRDIVSSDFLSNMSMDFQNHLGSCQKCDPSCPNGSCWGAGEENCQKLTKIICAQQCSGRCRGKSPSDCCHNQCAAGCTGPRESDCLVCRKFRDEATCKDTCPPLMLYNPTTYQMDVNPEGKYSFGATCVKKCPRNYVVTDHGSCVRACGADSYEMEEDGVRKCKKCEGPCRKVCNGIGIGEFKDSLSINATNIKHFKNCTSISGDLHILPVAFRGDSFTHTPPLDPQELDILKTVKEITGFLLIQAWPENRTDLHAFENLEIIRGRTKQHGQFSLAVVSLNITSLGLRSLKEISDGDVIISGNKNLCYANTINWKKLFGTSGQKTKIISNRGENSCKATGQVCHALCSPEGCWGPEPRDCVSCRNVSRGRECVDKCKLLEGEPREFVENSECIQCHPECLPQAMNITCTGRGPDNCIQCAHYIDGPHCVKTCPAGVMGENNTLVWKYADAGHVCHLCHPNCTYGCTGPGLRGCPTNGHHHHHH',
-        'SVDEECPASYEGFCQNDGTCLYLEKLDRYACRCREGYIGERCEFRDLDYWLEQ',
-        'DSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWENLEERLKEHRAKRLALLGPGPPGVVEKEKYKVSITEKVNPGGPATMPMTLTDSNGNKTTLTITVTPEGLEAIRKRRAGEKVKYTMTSTDTGDKFVLVDLDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLK',
-        'DSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWENLEERLKEHRAKRLALL',
+    'WVQLQESGGGLVQPGGSLRLSCAASGRTFSSYAMGWFRQAPGKQREFVAAIRWSGGYTYYTDSVKGRFTISRDNAKTTVYLQMNSLKPEDTAVYYCAATYLSSDYSRYALPQRPLDYDYWGQGTQVTVSSLE:LEEKKVCQGTSNKLTQLGTFEDHFLSLQRMFNNCEVVLGNLEITYVQRNYDLSFLKTIQEVAGYVLIALNTVERIPLENLQIIRGNMYYENSYALAVLSNYDANKTGLKELPMRNLQEILHGAVRFSNNPALCNVESIQWRDIVSSDFLSNMSMDFQNHLGSCQKCDPSCPNGSCWGAGEENCQKLTKIICAQQCSGRCRGKSPSDCCHNQCAAGCTGPRESDCLVCRKFRDEATCKDTCPPLMLYNPTTYQMDVNPEGKYSFGATCVKKCPRNYVVTDHGSCVRACGADSYEMEEDGVRKCKKCEGPCRKVCNGIGIGEFKDSLSINATNIKHFKNCTSISGDLHILPVAFRGDSFTHTPPLDPQELDILKTVKEITGFLLIQAWPENRTDLHAFENLEIIRGRTKQHGQFSLAVVSLNITSLGLRSLKEISDGDVIISGNKNLCYANTINWKKLFGTSGQKTKIISNRGENSCKATGQVCHALCSPEGCWGPEPRDCVSCRNVSRGRECVDKCKLLEGEPREFVENSECIQCHPECLPQAMNITCTGRGPDNCIQCAHYIDGPHCVKTCPAGVMGENNTLVWKYADAGHVCHLCHPNCTYGCTGPGLRGCPTNGHHHHHH',
+    'QVQLQESGGGLVQPGGSLRLSCAASGRTFSSHAMGWFRQAPGKQREFVAAIRWSGGYTYYTDSVKGRFTISRDNAKTTVYLQMNSLKPEDTAVYYCAATYLSSDYSRYALPQRPLDYDYWGQGTQVTVSSLE:LEEKKVCQGTSNKLTQLGTFEDHFLSLQRMFNNCEVVLGNLEITYVQRNYDLSFLKTIQEVAGYVLIALNTVERIPLENLQIIRGNMYYENSYALAVLSNYDANKTGLKELPMRNLQEILHGAVRFSNNPALCNVESIQWRDIVSSDFLSNMSMDFQNHLGSCQKCDPSCPNGSCWGAGEENCQKLTKIICAQQCSGRCRGKSPSDCCHNQCAAGCTGPRESDCLVCRKFRDEATCKDTCPPLMLYNPTTYQMDVNPEGKYSFGATCVKKCPRNYVVTDHGSCVRACGADSYEMEEDGVRKCKKCEGPCRKVCNGIGIGEFKDSLSINATNIKHFKNCTSISGDLHILPVAFRGDSFTHTPPLDPQELDILKTVKEITGFLLIQAWPENRTDLHAFENLEIIRGRTKQHGQFSLAVVSLNITSLGLRSLKEISDGDVIISGNKNLCYANTINWKKLFGTSGQKTKIISNRGENSCKATGQVCHALCSPEGCWGPEPRDCVSCRNVSRGRECVDKCKLLEGEPREFVENSECIQCHPECLPQAMNITCTGRGPDNCIQCAHYIDGPHCVKTCPAGVMGENNTLVWKYADAGHVCHLCHPNCTYGCTGPGLRGCPTNGHHHHHH',
+    'SVDEECPASYEGFCQNDGTCLYLEKLDRYACRCREGYIGERCEFRDLDYWLEQ',
+    'DSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWENLEERLKEHRAKRLALLGPGPPGVVEKEKYKVSITEKVNPGGPATMPMTLTDSNGNKTTLTITVTPEGLEAIRKRRAGEKVKYTMTSTDTGDKFVLVDLDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLK',
+    'DSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWENLEERLKEHRAKRLALL',
         'NSDSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWELR',
     ]
-    print(process_sequences.remote(binder_seqs))
+    process_sequences.remote(binder_seqs)

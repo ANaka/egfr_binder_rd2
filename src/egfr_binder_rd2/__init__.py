@@ -10,6 +10,7 @@ OUTPUT_DIRS = {
     "metrics_csv": Path("metrics.csv"),
     "msa_results": Path("msa_results/"),
     "lineage_csv": Path("lineage.csv"),
+    "esm2_pll_results": Path("esm2_pll_results/"),
 }
 
 LOGGING_CONFIG = {
