@@ -102,10 +102,15 @@ class ESM2Model:
     timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
     )
-def process_sequences(sequences: List[str]):
+def process_sequences(sequences: List[str]=None):
     # Create output directory if it doesn't exist
     results_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_pll_results']
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    if sequences is None:
+        logger.info("No sequences provided, using all folded sequences")
+        folded_metrics = pd.read_csv(Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['metrics_csv'])
+        sequences = folded_metrics['binder_sequence'].unique()
     
     logger.info(f"Processing {len(sequences)} sequences")
     logger.info(f"Results directory: {results_dir}")
@@ -120,13 +125,13 @@ def process_sequences(sequences: List[str]):
         result_path = results_dir / f"{seq_hash}.json"
         
         if result_path.exists():
-            logger.info(f"Found cached result for {seq_hash}")
             # Load cached result
             with open(result_path, 'r') as f:
                 cached_results.append(json.load(f))
         else:
-            logger.info(f"Need to process sequence {seq_hash}")
             sequences_to_process.append(seq)
+
+    logger.info(f"Sequences to process: {sequences_to_process}")
     
     # Process new sequences if any
     if sequences_to_process:
@@ -235,10 +240,6 @@ def update_pll_metrics():
     return df
 
 
-# @app.local_entrypoint()
-# def main():
-#     df = update_pll_metrics.remote()
-#     print(df)
 
 @app.local_entrypoint()
 def test_run():
