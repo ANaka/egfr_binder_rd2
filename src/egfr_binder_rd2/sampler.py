@@ -32,7 +32,6 @@ with image.imports():
 
 @app.cls(
     image=image,
-    gpu="A100",
     timeout=86400,  # 24 hours
     volumes={MODAL_VOLUME_PATH: volume},
     secrets=[wandb_secret],
@@ -109,6 +108,8 @@ class DirectedEvolution:
         
         for gen in range(1, generations + 1):
             logger.info(f"=== Generation {gen} ===")
+            logger.info(f'Current parent sequence length: {len(current_parent_seq)}')
+            logger.info(f"Current parent sequence: {current_parent_seq}")
             
             # Check if retraining is needed
             if self.should_retrain(gen, retrain_frequency):
@@ -118,25 +119,33 @@ class DirectedEvolution:
 
             # Step 1: Generate Variants
             logger.info("Sampling new binder sequences using EvoProtGrad...")
-            evoprotgrad_variants = self.sample_sequences.remote(
+            evoprotgrad_df = self.sample_sequences.remote(
                 sequence=current_parent_seq,
                 expert_configs=expert_configs,
                 n_chains=n_chains,
                 n_steps=n_steps,
                 max_mutations=max_mutations,
-                population_size=population_size,  # Add this parameter
                 seed=seed + gen,
             )
-            logger.info(f"Generated {len(evoprotgrad_variants)} variant sequences")
+            logger.info(f"Generated {len(evoprotgrad_df)} variant sequences")
             
-            # Step 2: Evaluate Variants
+            # Sample population_size sequences from the top fraction using the score column
+            sampled_variants = self.sample_from_top_sequences(
+                evoprotgrad_df,  # Pass the DataFrame directly, no need to wrap it
+                top_fraction=evoprotgrad_top_fraction,
+                sample_size=population_size,
+                temperature=sequence_sampling_temperature
+            )
+            logger.info(f"Sampled {len(sampled_variants)} sequences from top {evoprotgrad_top_fraction*100:.1f}% of variants")
+
+            # Continue with sampled variants
             logger.info("Processing sequences to obtain PLL metrics...")
-            self.process_sequences.remote(evoprotgrad_variants)
+            self.process_sequences.remote(sampled_variants)
             pll_df = self.update_pll_metrics.remote()
             logger.info(f"Obtained PLL metrics for {len(pll_df)} sequences")
 
             logger.info("Folding binder sequences...")
-            self.fold_binder.remote(evoprotgrad_variants)
+            self.fold_binder.remote(sampled_variants)
             metrics_df = self.update_metrics.remote()
             logger.info(f"Obtained folding metrics for {len(metrics_df)} sequences")
 
@@ -223,7 +232,7 @@ class DirectedEvolution:
         Sample sequences from the top fraction based on scores.
         
         Args:
-            df (pd.DataFrame): DataFrame with sequences and scores
+            df (pd.DataFrame): DataFrame with sequences and optionally scores
             top_fraction (float): Fraction of top sequences to consider (0-1)
             sample_size (int): Number of sequences to sample
             temperature (float): Temperature for softmax; higher values = more diversity
@@ -234,12 +243,17 @@ class DirectedEvolution:
         # Calculate number of sequences to keep
         n_keep = max(int(len(df) * top_fraction), sample_size)
         
-        # Get top sequences
-        top_df = df.head(n_keep)
+        if 'score' in df.columns:
+            # If we have scores, use them for weighted sampling
+            top_df = df.nlargest(n_keep, 'score') 
+            scores = top_df['score'].values
+        else:
+            # If no scores, just randomly sample from top fraction
+            top_df = df.sample(n=n_keep)
+            scores = np.ones(len(top_df))  # Equal probabilities
         
-        # Convert scores to probabilities using softmax
-        scores = -top_df['score'].values  # Negative because lower score is better
-        scores = scores / temperature  # Apply temperature scaling
+        # Apply temperature scaling
+        scores = scores / temperature
         probabilities = np.exp(scores - np.max(scores))  # Subtract max for numerical stability
         probabilities = probabilities / probabilities.sum()
         

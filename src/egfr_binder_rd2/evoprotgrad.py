@@ -327,7 +327,7 @@ def sample_sequences(
     df = df.drop_duplicates(subset=['sequence'])
     df = df.sort_values('score', ascending=False)
     
-    return df.head(300).sample(16)['sequence'].tolist()
+    return df
 
 @app.local_entrypoint()
 def main():
