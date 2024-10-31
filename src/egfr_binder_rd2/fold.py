@@ -1,20 +1,26 @@
 import os
-import argparse
-import tempfile
-import shutil
 import subprocess
 import logging
-from egfr_binder_rd2 import TEMPLATE_A3M_PATH, EGFS, EGFR, COLABFOLD_GPU_CONCURRENCY_LIMIT, FOLD_RESULTS_DIR
-from modal import Image, App, method, enter, Dict, Volume, Mount
-from egfr_binder_rd2.utils import get_mutation_diff, hash_seq
 import io
-import zipfile
 import re
 import json
 from datetime import datetime
-# from Bio import PDB  # Add this import at the module level
-# import numpy as np
-# import pandas as pd
+
+from modal import Image, App, method, enter, Dict, Volume, Mount
+
+from egfr_binder_rd2 import (
+    TEMPLATE_A3M_PATH, 
+    EGFS, 
+    EGFR, 
+    COLABFOLD_GPU_CONCURRENCY_LIMIT, 
+    FOLD_RESULTS_DIR, 
+    MODAL_VOLUME_NAME
+)
+from egfr_binder_rd2.utils import get_mutation_diff, hash_seq
+
+
+# Define constants for the modal volume path
+MODAL_VOLUME_PATH = "/data"
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,7 +29,7 @@ logger = logging.getLogger(__name__)
 app = App("colabfold")
 
 # Initialize the Volume
-volume = Volume.from_name("fold-results-volume", create_if_missing=True)
+volume = Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=True)
 
 # Create a mount for the template file
 template_mount = Mount.from_local_dir(
@@ -105,7 +111,7 @@ def generate_a3m_files(
     gpu='a100',
     timeout=9600,
     concurrency_limit=COLABFOLD_GPU_CONCURRENCY_LIMIT,
-    volumes={"/data": volume},
+    volumes={MODAL_VOLUME_PATH: volume},
     mounts=[template_mount]
 )
 class LocalColabFold:
@@ -128,14 +134,67 @@ class LocalColabFold:
     def fold(self, binder_sequences, template_a3m_path, target_a3m_path=None, target_sequence=None,  **kwargs):
         input_path = generate_a3m_files(
             binder_sequences=binder_sequences,
-            output_folder="/data/input_a3m",  # Using Volume path
+            output_folder=MODAL_VOLUME_PATH,
             template_a3m_path=template_a3m_path,
-            target_a3m_path=target_a3m_path,  # Pass the target A3M path
+            target_a3m_path=target_a3m_path,
             target_sequence=target_sequence
         )
         logger.info(f"Generated A3M files in: {input_path}")
 
-        out_dir = "/data/output"  # Using Volume path
+        out_dir = MODAL_VOLUME_PATH  # Using Volume path
+        os.makedirs(out_dir, exist_ok=True)
+        logger.info(f"Created output directory: {out_dir}")
+
+        cmd = ["colabfold_batch", input_path, out_dir]
+        
+        # Handle arguments
+        for key, value in kwargs.items():
+            key = key.replace('_', '-')
+            if isinstance(value, bool):
+                if value:
+                    cmd.append(f"--{key}")
+            elif value is not None:
+                cmd.extend([f"--{key}", str(value)])
+                
+        # Removed the zip flag
+        # cmd.append('--zip')
+        
+        logger.info(f"Running command: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info(f"Command output: {result.stdout}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Command failed with error: {e}")
+            logger.error(f"Error output: {e.stderr}")
+            raise
+        
+        logger.info(f'input directory contents: {os.listdir(input_path)}')
+        logger.info(f"Output directory contents: {os.listdir(out_dir)}")
+        logger.info(f'current directory contents: {os.listdir(".")}')
+        
+        # Directly process the output directory
+        all_results = self.extract_metrics_and_pdbs(out_dir)
+        logger.info(f"Extracted {len(all_results)} results")
+        
+        return all_results
+    
+    @method()
+    def raw_fold(self, sequences,  **kwargs):
+        
+        # Create a temporary directory for the FASTA file
+        temp_dir = os.path.join(MODAL_VOLUME_PATH, "temp_fasta")
+        os.makedirs(temp_dir, exist_ok=True)
+        input_path = os.path.join(temp_dir, "sequences.fasta")
+
+        # Write sequences to FASTA file
+        with open(input_path, "w") as f:
+            for name, seq in sequences.items():
+                f.write(f">{name}\n{seq}\n")
+        
+        logger.info(f"Wrote sequences to temporary FASTA file: {input_path}")
+
+        out_dir = MODAL_VOLUME_PATH  # Using Volume path
         os.makedirs(out_dir, exist_ok=True)
         logger.info(f"Created output directory: {out_dir}")
 
@@ -266,8 +325,8 @@ class LocalColabFold:
 
 @app.function(
     timeout=4800,
-    volumes={"/data": volume},
-    mounts=[template_mount]  # Mount remains the same
+    volumes={MODAL_VOLUME_PATH: volume},
+    mounts=[template_mount]
 )
 def fold_and_extract(
     binder_sequences: dict, 
@@ -288,8 +347,17 @@ def fold_and_extract(
 
 @app.function(
     timeout=12800,
-    volumes={"/data": volume},
-    mounts=[template_mount]  # Mount remains the same
+    volumes={MODAL_VOLUME_PATH: volume},
+    mounts=[template_mount]
+)
+def raw_fold(input_path, **kwargs):
+    lcf = LocalColabFold()
+    return lcf.raw_fold.remote(input_path, **kwargs)
+
+@app.function(
+    timeout=12800,
+    volumes={MODAL_VOLUME_PATH: volume},
+    mounts=[template_mount]
 )
 def parallel_fold_and_extract(
     binder_sequences: dict, 
@@ -424,4 +492,18 @@ def quick_test():
 
 
 
+@app.local_entrypoint()
+def quick_test_raw():
+    s = 'SKEEEYYEEHQKLAKPVEELWEKLDELEKTGKLTGEHRPLVTEFRRLWSDAMVLIAMYMWYLEEVDKNPSEENRKKAQEYLEKVEEKKKEMEELLKKL'
 
+
+    binder_sequences = {
+        hash_seq(s): f'{s}:{EGFR}'
+    }
+
+    result = raw_fold.remote(
+        input_path=binder_sequences,
+        num_models=1, 
+        num_recycle=1,
+    )
+    print("Test Results:", result)

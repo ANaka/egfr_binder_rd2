@@ -1,17 +1,17 @@
 import hashlib
-from egfr_binder_rd2 import PEPMLM_RESULTS_DIR, FOLD_RESULTS_DIR
-import re
-import pandas as pd
+import json
+from pathlib import Path
+from egfr_binder_rd2 import  OUTPUT_DIRS
 
 def hash_seq(sequence):
     """
     Generate a hash for a given protein sequence.
     
     Args:
-    sequence (str): The protein sequence to hash
+        sequence (str): The protein sequence to hash
     
     Returns:
-    str: A hexadecimal string representation of the hash
+        str: A hexadecimal string representation of the hash
     """
     # Remove any whitespace and convert to uppercase
     cleaned_sequence = ''.join(sequence.split()).upper()
@@ -25,46 +25,125 @@ def hash_seq(sequence):
     # Return the hexadecimal representation of the hash
     return hasher.hexdigest()[:6]
 
-
 def get_mutation_diff(seq1, seq2):
-
     """
     Compare two sequences and return a string of mutations.
     
     Args:
-    seq1 (str): The original sequence
-    seq2 (str): The mutated sequence
+        seq1 (str): The original sequence
+        seq2 (str): The mutated sequence
     
     Returns:
-    str: A comma-separated string of mutations in the format {original_aa}{position}{new_aa}
+        str: A comma-separated string of mutations in the format {original_aa}{position}{new_aa}
     """
     if len(seq1) != len(seq2):
         raise ValueError("Sequences must be of equal length")
     
     mutations = []
-    for i, (aa1, aa2) in enumerate(zip(seq2, seq1)):
+    for i, (aa1, aa2) in enumerate(zip(seq1, seq2)):
         if aa1 != aa2:
             mutations.append(f"{aa1}{i+1}{aa2}")
     
     return ",".join(mutations)
 
 
-def get_mlm_results():
-    csvs = list(PEPMLM_RESULTS_DIR.glob('*.csv'))
-    dfs = []
-    for csv in csvs:
-        _df = pd.read_csv(csv)
-        match = re.search(r'gen(\d+)', str(csv))
-        if match:
-            gen_num = int(match.group(1))
-        else:
-            gen_num = None
-        _df['generation'] = gen_num
-        dfs.append(_df)
-    pepmlm_df = pd.concat(dfs).sort_values('unmasked_ppl').reset_index(drop=True)
-    return pepmlm_df
+def get_fasta_path(sequences: list[str]) -> Path:
+    """
+    Generate the file path for the FASTA file based on the sequences.
+    
+    Args:
+        sequences (list[str]): A list of protein sequences.
+    
+    Returns:
+        Path: The path to the FASTA file.
+    """
+    all_seqs_hash = hash_seq("".join(sequences))
+    return OUTPUT_DIRS["fastas"] / f"{all_seqs_hash}.fasta"
 
-def get_mlm_ids():
-    mlm_df = get_mlm_results()
-    return mlm_df['seq_id'].unique().tolist()
+def get_folded_dir(binder_seq: str, target_seq: str) -> Path:
+    """
+    Generate the directory path for storing folded structures based on the binder and target sequences.
+    
+    Args:
+        binder_seq (str): The binder protein sequence.
+        target_seq (str): The target protein sequence.
+    
+    Returns:
+        Path: The directory path for folded structures.
+    """
+    binder_hash = hash_seq(binder_seq)
+    target_hash = hash_seq(target_seq)
+    return OUTPUT_DIRS["folded"] / f"{binder_hash}_{target_hash}"
+
+
+
+def parse_fasta_lines(lines):
+    """
+    Parse FASTA-like lines into a dictionary of header:sequence pairs.
+    
+    Args:
+        lines (list): List of strings containing FASTA format lines
+        
+    Returns:
+        dict: Dictionary with headers as keys and sequences as values
+    """
+    sequences = {}
+    current_header = None
+    current_sequence = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        if line.startswith('>'):
+            # If we were building a sequence, save it
+            if current_header is not None:
+                sequences[current_header] = ''.join(current_sequence)
+                current_sequence = []
+            
+            # Start new sequence, store header without '>'
+            current_header = line[1:].split('\t')[0]  # Take first part before tab
+        else:
+            # Add sequence line
+            current_sequence.append(line)
+    
+    # Don't forget to save the last sequence
+    if current_header is not None:
+        sequences[current_header] = ''.join(current_sequence)
+    
+    return sequences
+
+def swap_binder_seq_into_a3m(
+    binder_seq, 
+    template_a3m_path,  # Updated default path
+    output_path=None,  # New optional parameter
+):
+    
+    # Load template A3M
+    with open(template_a3m_path, 'r') as template_file:
+        template_lines = template_file.readlines()
+    
+
+    template_sequence = template_lines[2].strip()
+    binder_length = int(template_lines[0].split(',')[0].strip('#'))
+    target_sequence = template_sequence[binder_length:]
+    
+    seq_dict = parse_fasta_lines(template_lines[3:])
+    seq_dict['101'] = binder_seq + ''.join(['-'] * len(target_sequence))
+
+    with open(output_path, 'w') as output_file:
+        # Write the header line from template
+        output_file.writelines(template_lines[0])
+        
+        # Write the binder sequence (if provided) and target sequence
+        output_file.write('>101\t102\n')
+        output_file.write(f"{binder_seq}{target_sequence}\n")
+        
+        for header, seq in seq_dict.items():
+            output_file.write(f">{header}\n")
+            output_file.write(f"{seq}\n")
+    
+    return output_path
+
 
