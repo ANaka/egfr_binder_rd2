@@ -592,62 +592,62 @@ def update_metrics_for_all_folded():
     return df
 
 
-@app.function(
-    image=image,
-    timeout=9600,
-    volumes={MODAL_VOLUME_PATH: volume},
-)
-def rebuild_substituted_a3ms() -> List[Path]:
-    """Rebuild a3m files that were created by substitution, using the same parent templates
-    but redoing the substitution process.
+# @app.function(
+#     image=image,
+#     timeout=9600,
+#     volumes={MODAL_VOLUME_PATH: volume},
+# )
+# def rebuild_substituted_a3ms() -> List[Path]:
+#     """Rebuild a3m files that were created by substitution, using the same parent templates
+#     but redoing the substitution process.
     
-    Returns:
-        List[Path]: Paths to rebuilt a3m files
-    """
-    msa_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
-    rebuilt_paths = []
+#     Returns:
+#         List[Path]: Paths to rebuilt a3m files
+#     """
+#     msa_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
+#     rebuilt_paths = []
     
-    # Find all lineage files
-    lineage_files = list(msa_dir.glob("*.lineage.json"))
-    logger.info(f"Found {len(lineage_files)} sequences with lineage information")
+#     # Find all lineage files
+#     lineage_files = list(msa_dir.glob("*.lineage.json"))
+#     logger.info(f"Found {len(lineage_files)} sequences with lineage information")
     
-    for lineage_file in lineage_files:
-        try:
-            with open(lineage_file, 'r') as f:
-                lineage_data = json.load(f)
+#     for lineage_file in lineage_files:
+#         try:
+#             with open(lineage_file, 'r') as f:
+#                 lineage_data = json.load(f)
                 
-            binder_seq = lineage_data.get('binder_seq')
-            parent_seq = lineage_data.get('parent_seq')
+#             binder_seq = lineage_data.get('binder_seq')
+#             parent_seq = lineage_data.get('parent_seq')
             
-            if not (binder_seq and parent_seq):
-                logger.warning(f"Missing sequence information in {lineage_file}")
-                continue
+#             if not (binder_seq and parent_seq):
+#                 logger.warning(f"Missing sequence information in {lineage_file}")
+#                 continue
             
-            # Get paths
-            parent_hash = hash_seq(f"{parent_seq}:{EGFR}")
-            template_a3m_path = msa_dir / f"{parent_hash}.a3m"
-            output_a3m_path = msa_dir / f"{lineage_file.stem.replace('.lineage', '')}.a3m"
+#             # Get paths
+#             parent_hash = hash_seq(f"{parent_seq}:{EGFR}")
+#             template_a3m_path = msa_dir / f"{parent_hash}.a3m"
+#             output_a3m_path = msa_dir / f"{lineage_file.stem.replace('.lineage', '')}.a3m"
             
-            if not template_a3m_path.exists():
-                logger.warning(f"Parent template not found: {template_a3m_path}")
-                continue
+#             if not template_a3m_path.exists():
+#                 logger.warning(f"Parent template not found: {template_a3m_path}")
+#                 continue
                 
-            # Redo the substitution
-            logger.info(f"Rebuilding {output_a3m_path}")
-            rebuilt_path = swap_binder_seq_into_a3m(
-                binder_seq=binder_seq,
-                template_a3m_path=template_a3m_path,
-                output_path=output_a3m_path
-            )
-            rebuilt_paths.append(rebuilt_path)
+#             # Redo the substitution
+#             logger.info(f"Rebuilding {output_a3m_path}")
+#             rebuilt_path = swap_binder_seq_into_a3m(
+#                 binder_seq=binder_seq,
+#                 template_a3m_path=template_a3m_path,
+#                 output_path=output_a3m_path
+#             )
+#             rebuilt_paths.append(rebuilt_path)
             
-        except Exception as e:
-            logger.error(f"Failed to process {lineage_file}: {str(e)}")
-            continue
+#         except Exception as e:
+#             logger.error(f"Failed to process {lineage_file}: {str(e)}")
+#             continue
     
-    logger.info(f"Successfully rebuilt {len(rebuilt_paths)} a3m files")
-    return rebuilt_paths
+#     logger.info(f"Successfully rebuilt {len(rebuilt_paths)} a3m files")
+#     return rebuilt_paths
 
-@app.local_entrypoint()
-def do_rebuild():
-    rebuild_substituted_a3ms.remote()
+# @app.local_entrypoint()
+# def do_rebuild():
+#     rebuild_substituted_a3ms.remote()
