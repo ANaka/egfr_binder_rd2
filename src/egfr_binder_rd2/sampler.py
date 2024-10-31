@@ -290,7 +290,7 @@ class DirectedEvolution:
                     f"Parent {idx}: "
                     f"PLL={parent_metrics['sequence_log_pll']:.2f}, "
                     f"PAE={parent_metrics['pae_interaction']:.2f}, "
-                    f"Fitness={parent_metrics['fitness_score']:.2f}"
+                    f"Fitness={parent_metrics['fitness']:.2f}"
                 )
             
             # Store top sequences for final return
@@ -323,27 +323,6 @@ class DirectedEvolution:
         metadata.save(OUTPUT_DIRS["evolution_trajectories"])
         return list(set(all_final_sequences))  # Remove duplicates
 
-    @staticmethod
-    def calculate_fitness(df):
-        """
-        Calculate fitness scores based on ranked metrics.
-        
-        Args:
-            df (pd.DataFrame): DataFrame containing sequence_log_pll and pae_interaction
-            
-        Returns:
-            pd.DataFrame: DataFrame with added fitness_score column
-        """
-        # Rank sequences by sequence_log_pll (higher is better)
-        pll_ranks = df['sequence_log_pll'].rank(ascending=False)
-        
-        # Rank sequences by pae_interaction (lower is better)
-        pae_ranks = df['pae_interaction'].rank(ascending=True)
-        
-        # Calculate average rank (lower is better)
-        df['fitness_score'] = (pll_ranks + pae_ranks) / 2
-        
-        return df
 
     @staticmethod
     def sample_from_evoprotgrad_sequences(df, top_fraction=0.25, sample_size=10, temperature=1.0):
@@ -450,9 +429,9 @@ def main():
         n_to_fold=10,                # Total sequences to fold per generation
         num_parents=10,               # Number of parents to keep
         top_k=50,                    # Top sequences to consider
-        n_parallel_chains=8,        # Parallel chains per sequence
+        n_parallel_chains=4,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
-        n_steps=50,                  # Steps per chain
+        n_steps=20,                  # Steps per chain
         max_mutations=-1,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.2,
         parent_selection_temperature=2.0,
