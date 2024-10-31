@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 
 class SequenceDataModule(LightningDataModule):
     def __init__(self, df, tokenizer_name, yvar, batch_size=32, max_length=512, test_size=0.2, val_size=0.1, 
-                 seed=42, xvar='Sequence', transform_type='rank', make_negative:bool=False):
+                 seed=42, xvar='binder_sequence', transform_type='rank', make_negative:bool=False):
         super().__init__()
         self.df = df
         self.tokenizer_name = tokenizer_name
