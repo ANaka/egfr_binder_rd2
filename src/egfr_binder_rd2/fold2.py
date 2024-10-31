@@ -366,16 +366,7 @@ def a3m_from_template(binder_seqs: List[str], parent_binder_seqs: List[str], tar
     volumes={MODAL_VOLUME_PATH: volume},
 )
 def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[str, List[str]]=None, target_seq: str=EGFR) -> List[Path]:
-    """Fold one or more mutated binder sequences.
-    
-    Args:
-        binder_seqs: Single binder sequence or list of sequences to fold
-        parent_binder_seqs: Optional parent sequence(s) to use as template(s)
-        target_seq: Target sequence to pair with each binder
-        
-    Returns:
-        List of paths to folded structure files
-    """
+    """Fold one or more mutated binder sequences."""
     # Convert single sequences to lists for consistent handling
     if isinstance(binder_seqs, str):
         binder_seqs = [binder_seqs]
@@ -384,17 +375,23 @@ def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[st
     elif parent_binder_seqs is not None and len(parent_binder_seqs) == 1:
         parent_binder_seqs = parent_binder_seqs * len(binder_seqs)
     
+    logger.info(f"Folding sequences: {binder_seqs}")
+    logger.info(f"Using parent sequences: {parent_binder_seqs}")
+    
     # First, ensure we have MSAs for all sequences
     if parent_binder_seqs is None:
-        # Generate new MSAs if no parent sequences
+        logger.info("No parent sequences provided, generating new MSAs")
         a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
     else:
         # If parent sequences match binder sequences exactly, generate new MSAs
         if binder_seqs == parent_binder_seqs:
+            logger.info("Binder sequences match parent sequences, generating new MSAs")
             a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
         else:
-            # Use template MSAs
+            logger.info("Using template MSAs from parent sequences")
             a3m_paths = a3m_from_template.remote(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
+
+    logger.info(f"Generated a3m paths: {a3m_paths}")
 
     # Check that all a3m files exist
     missing_files = [path for path in a3m_paths if not path.exists()]
@@ -405,7 +402,14 @@ def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[st
     # Fold all sequences
     folded_paths = []
     for a3m_path in a3m_paths:
-        folded_paths.append(fold.remote(a3m_path))
+        logger.info(f"Starting fold for {a3m_path}")
+        try:
+            result = fold.remote(a3m_path)
+            logger.info(f"Fold result: {result}")
+            folded_paths.append(result)
+        except Exception as e:
+            logger.error(f"Folding failed for {a3m_path}: {str(e)}")
+            raise
     
     return folded_paths
 
@@ -587,3 +591,63 @@ def update_metrics_for_all_folded():
     
     return df
 
+
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def rebuild_substituted_a3ms() -> List[Path]:
+    """Rebuild a3m files that were created by substitution, using the same parent templates
+    but redoing the substitution process.
+    
+    Returns:
+        List[Path]: Paths to rebuilt a3m files
+    """
+    msa_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
+    rebuilt_paths = []
+    
+    # Find all lineage files
+    lineage_files = list(msa_dir.glob("*.lineage.json"))
+    logger.info(f"Found {len(lineage_files)} sequences with lineage information")
+    
+    for lineage_file in lineage_files:
+        try:
+            with open(lineage_file, 'r') as f:
+                lineage_data = json.load(f)
+                
+            binder_seq = lineage_data.get('binder_seq')
+            parent_seq = lineage_data.get('parent_seq')
+            
+            if not (binder_seq and parent_seq):
+                logger.warning(f"Missing sequence information in {lineage_file}")
+                continue
+            
+            # Get paths
+            parent_hash = hash_seq(f"{parent_seq}:{EGFR}")
+            template_a3m_path = msa_dir / f"{parent_hash}.a3m"
+            output_a3m_path = msa_dir / f"{lineage_file.stem.replace('.lineage', '')}.a3m"
+            
+            if not template_a3m_path.exists():
+                logger.warning(f"Parent template not found: {template_a3m_path}")
+                continue
+                
+            # Redo the substitution
+            logger.info(f"Rebuilding {output_a3m_path}")
+            rebuilt_path = swap_binder_seq_into_a3m(
+                binder_seq=binder_seq,
+                template_a3m_path=template_a3m_path,
+                output_path=output_a3m_path
+            )
+            rebuilt_paths.append(rebuilt_path)
+            
+        except Exception as e:
+            logger.error(f"Failed to process {lineage_file}: {str(e)}")
+            continue
+    
+    logger.info(f"Successfully rebuilt {len(rebuilt_paths)} a3m files")
+    return rebuilt_paths
+
+@app.local_entrypoint()
+def do_rebuild():
+    rebuild_substituted_a3ms.remote()
