@@ -124,7 +124,6 @@ class BTRegressionModule(pl.LightningModule):
         )
         if scores_i is not None:
             bt_loss = self.bt_loss(scores_i, scores_j, y_ij)
-            self.log("train_bt_loss", bt_loss)
             return bt_loss
         return torch.tensor(0.0, device=self.device)
 
