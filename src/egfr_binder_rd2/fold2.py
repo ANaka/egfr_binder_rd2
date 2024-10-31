@@ -70,7 +70,7 @@ with image.imports():
 
 @app.cls(
     image=image,
-    gpu='a100',
+    gpu="H100",
     timeout=9600,
     concurrency_limit=COLABFOLD_GPU_CONCURRENCY_LIMIT,
     volumes={MODAL_VOLUME_PATH: volume},
@@ -298,11 +298,7 @@ def get_a3m_path(binder_seq: str, target_seq: str) -> Path:
     seq_hash = hash_seq(f'{binder_seq}:{target_seq}')
     return Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"] / f"{seq_hash}.a3m"
 
-@app.function(
-    image=image,
-    timeout=9600,
-    volumes={MODAL_VOLUME_PATH: volume},
-)
+
 def a3m_from_template(binder_seqs: List[str], parent_binder_seqs: List[str], target_seq: str=EGFR) -> List[Path]:
     """Get the a3m file paths for given binder sequences using their parent sequences as templates.
     
@@ -389,24 +385,75 @@ def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[st
             a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
         else:
             logger.info("Using template MSAs from parent sequences")
-            a3m_paths = a3m_from_template.remote(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
+            a3m_paths = a3m_from_template(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
 
     logger.info(f"Generated a3m paths: {a3m_paths}")
+    volume.commit()
+    logger.info("Committed volume")
 
+    volume.reload()
+    logger.info("Reloaded volume")
+    
     # Check that all a3m files exist
     missing_files = [path for path in a3m_paths if not path.exists()]
     if missing_files:
         logger.error(f"MSA files not found after generation attempt: {missing_files}")
         raise FileNotFoundError(f"MSA generation failed for: {missing_files}")
 
+    # Initialize ColabFold instance
+    colabfold = LocalColabFold()
+    output_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+
     # Fold all sequences
     folded_paths = []
     for a3m_path in a3m_paths:
         logger.info(f"Starting fold for {a3m_path}")
         try:
-            result = fold.remote(a3m_path)
-            logger.info(f"Fold result: {result}")
-            folded_paths.append(result)
+            # Get sequence hash from a3m path
+            seq_hash = a3m_path.stem
+            
+            # Run folding
+            colabfold.colabfold_batch.remote(a3m_path, output_dir, num_models=1, num_recycle=1)
+            
+            volume.commit()
+            logger.info("Committed volume")
+            
+            volume.reload()
+            logger.info("Reloaded volume")
+            
+            # Look for the scores files
+            logger.info(f"Searching for scores files with pattern: {seq_hash}_scores*.json")
+            scores_files = list(output_dir.glob(f"{seq_hash}_scores*.json"))
+            
+            if not scores_files:
+                logger.error(f"No scores files found for {seq_hash} in {output_dir}")
+                # List all files in output directory for debugging
+                all_files = list(output_dir.glob("*"))
+                logger.info(f"All files in output directory: {[f.name for f in all_files]}")
+                raise FileNotFoundError(f"No scores files found for {seq_hash}")
+            
+            # Extract metrics from scores files
+            metrics = []
+            for scores_file in scores_files:
+                with open(scores_file, 'r') as f:
+                    data = json.load(f)
+                    
+                rank_match = re.search(r'rank_(\d+)', scores_file.name)
+                model_number = int(rank_match.group(1)) if rank_match else 0
+                
+                metrics.append({
+                    'seq_hash': seq_hash,
+                    'model_number': model_number,
+                    'plddt': np.mean(data.get('plddt', [])),
+                    'ptm': data.get('ptm', 0),
+                    'i_ptm': data.get('iptm', 0),
+                    'pae': np.mean(data.get('pae', [])) if data.get('pae') else None
+                })
+            
+            logger.info(f"Extracted metrics from {len(metrics)} models for {seq_hash}")
+            return metrics
+
         except Exception as e:
             logger.error(f"Folding failed for {a3m_path}: {str(e)}")
             raise
@@ -651,3 +698,21 @@ def update_metrics_for_all_folded():
 # @app.local_entrypoint()
 # def do_rebuild():
 #     rebuild_substituted_a3ms.remote()
+
+@app.local_entrypoint()
+def benchmark_fold():
+    import time
+    logger.info("Starting benchmark fold")
+    start_time = time.time()
+
+    parent_binder_seq = 'PSFSACPSNYDGYCMNGGVCHYFESLTSITCQCIIGYIGDRCQTFDLRYTELRR'
+    binder_seqs = ['PSFSACPSNYDGYCMNGGVCHYFESLTSITCQCIIGYIGDRCQTDDLRYTELRR']
+
+    logger.info("Calling fold_binder")
+    result = fold_binder.remote(binder_seqs=binder_seqs, parent_binder_seqs=[parent_binder_seq])
+    
+    end_time = time.time()
+    duration = end_time - start_time
+    logger.info(f"Benchmark fold completed in {duration:.2f} seconds")
+
+    return result
