@@ -14,7 +14,8 @@ from egfr_binder_rd2 import (
     MODAL_VOLUME_NAME,
     MSA_QUERY_HOST_URL,
     OUTPUT_DIRS,
-    LOGGING_CONFIG
+    LOGGING_CONFIG,
+    MODAL_VOLUME_PATH
 )
 from egfr_binder_rd2.utils import (
     get_mutation_diff, 
@@ -33,7 +34,7 @@ EGFR_EPITOPE_RESIDUES = [11, 12, 13, 15, 16, 17, 18, 356, 440, 441]
 INTERACTION_CUTOFF = 4.0  # Angstroms
 
 # Define constants for the modal volume path
-MODAL_VOLUME_PATH = "/colabfold_data"
+
 
 # Set up logging using configuration
 logging.basicConfig(level=LOGGING_CONFIG["level"], format=LOGGING_CONFIG["format"])
