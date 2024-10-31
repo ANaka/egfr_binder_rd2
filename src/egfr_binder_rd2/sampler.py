@@ -465,16 +465,16 @@ def main():
         n_to_fold=10,                # Total sequences to fold per generation
         num_parents=10,               # Number of parents to keep
         top_k=50,                    # Top sequences to consider
-        n_parallel_chains=4,        # Parallel chains per sequence
+        n_parallel_chains=16,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
-        n_steps=20,                  # Steps per chain
+        n_steps=100,                  # Steps per chain
         max_mutations=-1,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.2,
         parent_selection_temperature=2.0,
         sequence_sampling_temperature=2.0,
         retrain_frequency=10,
         seed=42,
-        select_from_current_gen_only=True,  # Add this parameter
+        select_from_current_gen_only=False,  # Add this parameter
     )
     
     print(f"Final evolved sequences: {final_sequences}")
