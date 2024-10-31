@@ -227,16 +227,12 @@ class MSAQuery:
             List of paths to generated MSA files
         """
         fasta_path = self.save_sequences_as_fasta.remote(sequences)
-        logger.info(f"Created FASTA file at: {fasta_path}")
-        
         out_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
         out_dir.mkdir(parents=True, exist_ok=True)
         
-        result_dir = self.query_msa_server.remote(fasta_path, out_dir)
-        
-        # Return list of generated a3m files
-        a3m_files = list(Path(result_dir).glob("*.a3m"))
-        return a3m_files
+        # query_msa_server returns a single a3m path, not a directory
+        a3m_path = self.query_msa_server.remote(fasta_path, out_dir)
+        return [a3m_path]  # Return as list to maintain interface
 
 
 @app.function(
