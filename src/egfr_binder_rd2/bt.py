@@ -158,8 +158,9 @@ class BTRegressionModule(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
-    def predict_step(self, batch, batch_idx):
-        return self(batch)
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        outputs = self(batch)
+        return outputs['predictions'].squeeze()
 
     def save_adapter(self, save_path):
         adapter_state_dict = get_peft_model_state_dict(self.esm_model)
