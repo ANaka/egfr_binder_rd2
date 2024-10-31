@@ -103,7 +103,7 @@ def parse_fasta_lines(lines):
                 current_sequence = []
             
             # Start new sequence, store header without '>'
-            current_header = line[1:].split('\t')[0]  # Take first part before tab
+            current_header = line[1:]
         else:
             # Add sequence line
             current_sequence.append(line)
