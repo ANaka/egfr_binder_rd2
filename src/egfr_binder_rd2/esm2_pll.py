@@ -40,7 +40,7 @@ with image.imports():
     import numpy as np
 
 @app.cls(
-    gpu="A10G",
+    gpu="A100",
     image=image,
     container_idle_timeout=1200,
     timeout=9600,
@@ -55,7 +55,7 @@ class ESM2Model:
         self.model.eval()
 
     @modal.method()
-    def predict_batch(self, sequences: List[str], batch_size: int = 4, alpha: float = 0.1, beta: float = 0.1):
+    def predict_batch(self, sequences: List[str], batch_size: int = 32, alpha: float = 0.1, beta: float = 0.1):
         all_results = []
         
         for i in range(0, len(sequences), batch_size):
@@ -102,7 +102,7 @@ class ESM2Model:
     timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
     )
-def process_sequences(sequences: List[str]=None):
+def process_sequences(sequences: List[str]=None, save_results: bool=True):
     # Create output directory if it doesn't exist
     results_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_pll_results']
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -140,21 +140,22 @@ def process_sequences(sequences: List[str]=None):
         new_results = model.predict_batch.remote(sequences_to_process)
         logger.info(f"Received predictions for {len(new_results)} sequences")
         
-        # Add hash to results and save individually
-        for seq, result in zip(sequences_to_process, new_results):
-            seq_hash = f"bdr_{hash_seq(seq)}"
-            result['sequence_hash'] = seq_hash
-            
-            # Convert NumPy arrays to lists before saving
-            result['token_probabilities'] = result['token_probabilities'].tolist()
-            result['mask_consistent_probabilities'] = result['mask_consistent_probabilities'].tolist()
-            result['token_log_plls'] = result['token_log_plls'].tolist()
-            
-            # Save individual result
-            result_path = results_dir / f"{seq_hash}.json"
-            logger.info(f"Saving result to {result_path}")
-            with open(result_path, 'w') as f:
-                json.dump(result, f, indent=2)
+        if save_results:
+            # Add hash to results and save individually
+            for seq, result in zip(sequences_to_process, new_results):
+                seq_hash = f"bdr_{hash_seq(seq)}"
+                result['sequence_hash'] = seq_hash
+                
+                # Convert NumPy arrays to lists before saving
+                result['token_probabilities'] = result['token_probabilities'].tolist()
+                result['mask_consistent_probabilities'] = result['mask_consistent_probabilities'].tolist()
+                result['token_log_plls'] = result['token_log_plls'].tolist()
+                
+                # Save individual result
+                result_path = results_dir / f"{seq_hash}.json"
+                logger.info(f"Saving result to {result_path}")
+                with open(result_path, 'w') as f:
+                    json.dump(result, f, indent=2)
         
         # Combine with cached results
         all_results = cached_results + new_results
