@@ -1,4 +1,6 @@
 from pathlib import Path
+import enum
+from dataclasses import dataclass
 
 # Configuration Constants
 MSA_QUERY_HOST_URL = "https://api.colabfold.com"
@@ -44,3 +46,22 @@ COLABFOLD_GPU_CONCURRENCY_LIMIT = 2
 
 # Volume Name
 MODAL_VOLUME_NAME = "egfr_binders"
+
+
+class ExpertType(enum.Enum):
+    ESM = "esm"
+    iPAE = "pae_interaction"
+    iPTM = "i_ptm"
+    
+    @classmethod
+    def from_str(cls, label: str) -> 'ExpertType':
+        return cls(label.lower())
+
+@dataclass
+class ExpertConfig:
+    type: ExpertType
+    weight: float = 1.0
+    temperature: float = 1.0
+    make_negative: bool = False
+    transform_type: str = "rank"
+    model_name: str = "facebook/esm2_t6_8M_UR50D"
