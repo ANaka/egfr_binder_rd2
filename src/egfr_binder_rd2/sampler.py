@@ -46,6 +46,7 @@ class DirectedEvolution:
         self.process_sequences = modal.Function.lookup("esm2-inference", "process_sequences")
         self.update_pll_metrics = modal.Function.lookup("esm2-inference", "update_pll_metrics")
         self.fold_binder = modal.Function.lookup("simplefold", "fold_binder")
+        self.parallel_fold_binder = modal.Function.lookup("simplefold", "parallel_fold_binder")
         self.update_metrics = modal.Function.lookup("simplefold", "update_metrics_for_all_folded")
         
         logger.info("Initialized DirectedEvolution workflow.")
@@ -154,7 +155,32 @@ class DirectedEvolution:
             # Check if retraining is needed
             if self.should_retrain(gen, retrain_frequency):
                 logger.info(f"Generation {gen}: Retraining experts...")
-                expert_configs = self.retrain_experts()
+                
+                # Train PAE interaction expert
+                pae_model_path = self.train_bt_model.remote(
+                    yvar="pae_interaction",
+                    wandb_project="egfr-binder-rd2",
+                    wandb_entity="anaka",
+                    transform_type="rank",
+                    make_negative=True,
+                )
+                logger.info(f"Trained PAE interaction expert: {pae_model_path}")
+                
+                # Return updated expert configs
+                expert_configs = [
+                    ExpertConfig(
+                        type=ExpertType.ESM,  # This is correct
+                        weight=1.0,
+                        temperature=1.0,
+                    ),
+                    ExpertConfig(
+                        type=ExpertType.iPAE,  # Changed from PAE to iPAE
+                        weight=1.0,
+                        temperature=1.0,
+                        make_negative=True,
+                        transform_type="rank",
+                    ),
+                ]
                 logger.info("Expert retraining completed.")
             
             # Calculate sequences to sample per parent
@@ -199,18 +225,27 @@ class DirectedEvolution:
             variant_seqs = [v[0] for v in all_variants_with_parents]
             parent_seqs = [v[1] for v in all_variants_with_parents]
             
-            # Get PLL metrics
-            logger.info("Processing sequences to obtain PLL metrics...")
-            self.process_sequences.remote(all_variants)
-            pll_df = self.update_pll_metrics.remote()
-            logger.info(f"Obtained PLL metrics for {len(pll_df)} sequences")
+            
             
             # Get folding metrics, now passing parent sequences
-            logger.info("Folding binder sequences...")
-            self.fold_binder.remote(variant_seqs, parent_seqs)
+            logger.info(f"Folding {len(variant_seqs)} binder sequences...")
+            fold_results = self.parallel_fold_binder.remote(variant_seqs, parent_seqs)
+            logger.info(fold_results)
+            volume.reload()
+            
+
+            # Get PLL metrics
+            logger.info(f"Processing sequences to obtain PLL metrics...")
+            self.process_sequences.remote()
+            
+            
+            volume.reload()
             metrics_df = self.update_metrics.remote()
             logger.info(f"Obtained folding metrics for {len(metrics_df)} sequences")
-            
+            pll_df = self.update_pll_metrics.remote()
+            logger.info(f"Obtained PLL metrics for {len(pll_df)} sequences")
+
+
             # Merge and calculate fitness
             logger.info("Merging metrics and calculating fitness scores...")
             combined_df = pll_df.merge(metrics_df, left_on='sequence', right_on='binder_sequence', how="inner")
@@ -219,6 +254,7 @@ class DirectedEvolution:
             # Filter for current generation if requested
             if select_from_current_gen_only:
                 logger.info(f"Calculating fitness using only current generation sequences")
+                logger.info(f'Current generation sequences: {all_variants}')
                 ranking_df = combined_df[combined_df['binder_sequence'].isin(all_variants)]
                 logger.info(f"Found {len(ranking_df)} sequences from current generation")
             else:
@@ -425,7 +461,7 @@ def main():
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
-        generations=4,
+        generations=40,
         n_to_fold=10,                # Total sequences to fold per generation
         num_parents=10,               # Number of parents to keep
         top_k=50,                    # Top sequences to consider
@@ -436,7 +472,7 @@ def main():
         evoprotgrad_top_fraction=0.2,
         parent_selection_temperature=2.0,
         sequence_sampling_temperature=2.0,
-        retrain_frequency=2,
+        retrain_frequency=10,
         seed=42,
         select_from_current_gen_only=True,  # Add this parameter
     )
