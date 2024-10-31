@@ -70,7 +70,7 @@ with image.imports():
 
 @app.cls(
     image=image,
-    gpu="H100",
+    gpu="A10G",
     timeout=9600,
     concurrency_limit=COLABFOLD_GPU_CONCURRENCY_LIMIT,
     volumes={MODAL_VOLUME_PATH: volume},
@@ -117,6 +117,7 @@ class LocalColabFold:
             logger.error(f"Command failed with error: {e}")
             logger.error(f"Error output: {e.stderr}")
             raise
+        volume.commit()
         
     @staticmethod
     def extract_sequence_from_pdb(pdb_content):
@@ -429,8 +430,6 @@ def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[st
             if not scores_files:
                 logger.error(f"No scores files found for {seq_hash} in {output_dir}")
                 # List all files in output directory for debugging
-                all_files = list(output_dir.glob("*"))
-                logger.info(f"All files in output directory: {[f.name for f in all_files]}")
                 raise FileNotFoundError(f"No scores files found for {seq_hash}")
             
             # Extract metrics from scores files
@@ -705,8 +704,12 @@ def benchmark_fold():
     logger.info("Starting benchmark fold")
     start_time = time.time()
 
-    parent_binder_seq = 'PSFSACPSNYDGYCMNGGVCHYFESLTSITCQCIIGYIGDRCQTFDLRYTELRR'
-    binder_seqs = ['PSFSACPSNYDGYCMNGGVCHYFESLTSITCQCIIGYIGDRCQTDDLRYTELRR']
+    parent_binder_seq = 'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS'
+    binder_seqs = [
+        # 'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
+        # 'AERMRRRFEHIVEIHEEWAKEELENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
+        'AERMRRRFEHIVEIHEEWAKEVEENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS'
+        ]
 
     logger.info("Calling fold_binder")
     result = fold_binder.remote(binder_seqs=binder_seqs, parent_binder_seqs=[parent_binder_seq])
