@@ -384,7 +384,9 @@ def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[st
     if isinstance(binder_seqs, str):
         binder_seqs = [binder_seqs]
     if isinstance(parent_binder_seqs, str):
-        parent_binder_seqs = [parent_binder_seqs]
+        parent_binder_seqs = [parent_binder_seqs] * len(binder_seqs)
+    elif parent_binder_seqs is not None and len(parent_binder_seqs) == 1:
+        parent_binder_seqs = parent_binder_seqs * len(binder_seqs)
     
     # Handle case where no parent sequences are provided
     if parent_binder_seqs is None:
