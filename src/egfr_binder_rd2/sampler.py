@@ -1,10 +1,12 @@
 import modal
-from typing import List, Optional
+from typing import List, Optional, Dict
 import logging
 import pandas as pd
 import torch
 from datetime import datetime
+import numpy as np
 
+from egfr_binder_rd2.bt import BTEnsemble
 from egfr_binder_rd2 import LOGGING_CONFIG, MODAL_VOLUME_PATH, OUTPUT_DIRS, ExpertType, ExpertConfig, EvolutionMetadata
 
 # Set up logging
@@ -105,6 +107,7 @@ class DirectedEvolution:
         retrain_frequency: int = 5,         # How often to retrain experts (every N generations)
         seed: int = 42,                     # Random seed for reproducibility
         select_from_current_gen_only: bool = False,  # New parameter
+        ensemble_dir: str = None,
     ):
         """Run multiple cycles of directed evolution with multiple parent sequences.
         
@@ -147,6 +150,10 @@ class DirectedEvolution:
             "seed": seed
         }
         metadata = EvolutionMetadata.create(config, parent_binder_seqs)
+        
+        # Load ensemble if provided
+        if ensemble_dir:
+            self.ensemble = BTEnsemble.load(ensemble_dir, n_models=5)
         
         for gen in range(1, generations + 1):
             logger.info(f"=== Generation {gen} ===")
@@ -455,6 +462,51 @@ class DirectedEvolution:
         )
         return df.iloc[selected_indices]['binder_sequence'].tolist()
 
+class UCBSequenceSelector:
+    def __init__(self, exploration_weight: float = 2.0):
+        self.exploration_weight = exploration_weight
+        self.sequence_counts = {}
+        self.sequence_rewards = {}
+        self.total_trials = 0
+        
+    def calculate_ucb(self, sequence: str, mean_pred: float, std_pred: float) -> float:
+        n = self.sequence_counts.get(sequence, 0)
+        
+        # If sequence never seen, use high uncertainty
+        if n == 0:
+            return mean_pred + self.exploration_weight * std_pred
+        
+        # Calculate UCB score
+        exploitation = self.sequence_rewards[sequence] / n
+        exploration = self.exploration_weight * np.sqrt(np.log(self.total_trials) / n)
+        return exploitation + exploration
+    
+    def select_sequences(
+        self,
+        candidates: List[str],
+        ensemble_predictions: Dict[str, np.ndarray],
+        n_select: int
+    ) -> List[str]:
+        """Select sequences using UCB strategy"""
+        ucb_scores = []
+        
+        for i, seq in enumerate(candidates):
+            mean_pred = ensemble_predictions["mean"][i]
+            std_pred = ensemble_predictions["std"][i]
+            ucb_score = self.calculate_ucb(seq, mean_pred, std_pred)
+            ucb_scores.append(ucb_score)
+        
+        # Select top sequences by UCB score
+        selected_indices = np.argsort(ucb_scores)[-n_select:]
+        return [candidates[i] for i in selected_indices]
+    
+    def update(self, sequence: str, reward: float):
+        """Update sequence statistics after evaluation"""
+        self.sequence_counts[sequence] = self.sequence_counts.get(sequence, 0) + 1
+        current_reward = self.sequence_rewards.get(sequence, 0)
+        self.sequence_rewards[sequence] = current_reward + reward
+        self.total_trials += 1
+
 @app.local_entrypoint()
 def main():
     # Define multiple parent sequences
@@ -467,11 +519,11 @@ def main():
         parent_binder_seqs=parent_binder_seqs,
         generations=80,
         n_to_fold=50,                # Total sequences to fold per generation
-        num_parents=10,               # Number of parents to keep
+        num_parents=25,               # Number of parents to keep
         top_k=50,                    # Top sequences to consider
-        n_parallel_chains=32,        # Parallel chains per sequence
+        n_parallel_chains=16,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
-        n_steps=200,                  # Steps per chain
+        n_steps=100,                  # Steps per chain
         max_mutations=5,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.25,
         parent_selection_temperature=0.5,

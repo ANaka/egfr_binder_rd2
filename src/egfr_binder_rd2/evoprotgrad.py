@@ -1,5 +1,5 @@
 import modal
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from pathlib import Path
 import pandas as pd
 import torch
@@ -13,6 +13,11 @@ from datetime import datetime
 from dataclasses import dataclass
 import enum
 from typing import Any
+import numpy as np
+from sklearn.model_selection import KFold
+import time
+from functools import wraps
+import random
 
 import evo_prot_grad
 
@@ -25,7 +30,7 @@ from egfr_binder_rd2 import (
     ExpertConfig,
 )
 from egfr_binder_rd2.datamodule import SequenceDataModule
-from egfr_binder_rd2.bt import BTRegressionModule
+from egfr_binder_rd2.bt import BTRegressionModule, BTEnsemble
 from egfr_binder_rd2.esm_regression_expert import EsmRegressionExpert
 import logging
 from egfr_binder_rd2.utils import hash_seq
@@ -48,6 +53,7 @@ image = (
         "peft",
         "torchmetrics",
         "evo-prot-grad",
+        "scikit-learn",
     )
 )
 
@@ -463,4 +469,202 @@ def train():
         make_negative=False,
         seed=117,
     )
+
+@app.function(
+    image=image,
+    gpu="A100",
+    timeout=3600,
+    volumes={MODAL_VOLUME_PATH: volume},
+    secrets=[wandb_secret],
+)
+def train_ensemble_member(
+    df: pd.DataFrame,
+    yvar: str,
+    model_name: str,
+    wandb_project: str,
+    wandb_entity: str,
+    fold_idx: int,
+    fold_indices: tuple,  # (train_idx, val_idx)
+    **kwargs
+) -> Tuple[str, float]:
+    """Train a single ensemble member using k-fold split"""
+    # Set random seeds for reproducibility
+    torch.manual_seed(fold_idx)
+    np.random.seed(fold_idx)
+    
+    # Split data using provided indices
+    train_idx, val_idx = fold_indices
+    train_df = df.iloc[train_idx]
+    val_df = df.iloc[val_idx]
+    
+    # Create data module with the fold split
+    data_module = SequenceDataModule(
+        df=train_df,
+        val_df=val_df,  # Pass validation df directly
+        tokenizer_name=model_name,
+        yvar=yvar,
+        **kwargs
+    )
+    
+    # Initialize model
+    model = BTRegressionModule(
+        label=yvar,
+        model_name=model_name,
+        **kwargs
+    )
+    
+    # Train model
+    wandb_logger = WandbLogger(
+        project=wandb_project,
+        entity=wandb_entity,
+        name=f"ensemble_member_fold_{fold_idx}"
+    )
+    
+    trainer = Trainer(
+        max_epochs=kwargs.get('max_epochs', 10),
+        logger=wandb_logger,
+        callbacks=[EarlyStopping(monitor="val_spearman", mode="max", patience=3)],
+        accelerator="gpu",
+        devices=1,
+    )
+    
+    trainer.fit(model, data_module)
+    
+    # Get validation score
+    val_score = trainer.callback_metrics["val_spearman"].item()
+    
+    # Save model and commit volume
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    model_path = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["bt_models"] / f"ensemble_{timestamp}_fold{fold_idx}.pt"
+    model.save_adapter(model_path)
+    volume.commit()
+    
+    return str(model_path), val_score
+
+def retry_with_backoff(retries=3, backoff_in_seconds=1):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            x = 0
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except FileNotFoundError as e:
+                    if x == retries:
+                        raise e
+                    sleep = (backoff_in_seconds * 2 ** x + 
+                            random.uniform(0, 1))
+                    time.sleep(sleep)
+                    x += 1
+                    # Reload volume before retry
+                    volume.reload()
+        return wrapper
+    return decorator
+
+@retry_with_backoff(retries=3, backoff_in_seconds=1)
+def load_model_with_retry(model_path: str) -> BTRegressionModule:
+    return BTRegressionModule.load_adapter(model_path)
+
+@app.function(
+    image=image,
+    volumes={MODAL_VOLUME_PATH: volume},
+    secrets=[wandb_secret],
+)
+def train_ensemble(
+    yvar: str,
+    wandb_project: str,
+    wandb_entity: str,
+    n_folds: int = 5,
+    **kwargs
+) -> str:
+    """Train an ensemble of models using k-fold cross validation"""
+    # Load data
+    metrics_file = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["metrics_csv"]
+    df = pd.read_csv(metrics_file)
+    
+    # Create k-fold splits
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    fold_indices = list(kf.split(df))
+    
+    # Train ensemble members in parallel
+    results = []
+    
+    for model_path, val_score in train_ensemble_member.map(
+        [df] * n_folds,
+        [yvar] * n_folds,
+        [kwargs.get('model_name', "facebook/esm2_t6_8M_UR50D")] * n_folds,
+        [wandb_project] * n_folds,
+        [wandb_entity] * n_folds,
+        range(n_folds),  # fold indices
+        fold_indices,
+        **kwargs
+    ):
+        results.append((model_path, val_score))
+    
+    # Create ensemble directory
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ensemble_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["bt_models"] / f"ensemble_{timestamp}"
+    ensemble_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Reload volume to get latest changes
+    volume.reload()
+    
+    # Save ensemble members
+    ensemble = BTEnsemble(n_models=n_folds)
+    for model_path, val_score in results:
+        # Use retry logic when loading models
+        model = load_model_with_retry(model_path)
+        fold_idx = int(model_path.split("fold")[-1].split(".")[0])
+        ensemble.add_member(model, val_score, fold_idx)
+    
+    ensemble.save(str(ensemble_dir))
+    volume.commit()
+    
+    return str(ensemble_dir)
+
+@app.local_entrypoint()
+def train_ensemble_local():
+    train_ensemble.remote(
+        yvar="pae_interaction",
+        wandb_project="egfr-binder-rd2",
+        wandb_entity="anaka_personal",
+        n_folds=5,
+    )
+
+@app.cls(
+    image=image,
+    gpu="A100",
+    volumes={MODAL_VOLUME_PATH: volume}
+)
+class EnsemblePredictor:
+    def __init__(self, ensemble_dir: str, n_models: int = 5):
+        self.ensemble_dir = ensemble_dir
+        self.n_models = n_models
+        self.ensemble = None
+
+    @modal.enter()
+    def load_ensemble(self):
+        """Load ensemble on container startup"""
+        volume.reload()  # Ensure we have latest version
+        self.ensemble = BTEnsemble.load(self.ensemble_dir, self.n_models)
+        torch.set_float32_matmul_precision('high')
+
+    @modal.method()
+    def predict(self, sequences: List[str]) -> Dict[str, np.ndarray]:
+        """Get predictions and uncertainties for sequences"""
+        predictions = []
+        for model in self.ensemble.models:
+            with torch.no_grad():
+                model_preds = model.predict(sequences)
+                predictions.append(model_preds)
+        
+        # Stack predictions and compute statistics
+        predictions = np.stack(predictions)
+        mean_preds = np.mean(predictions, axis=0)
+        std_preds = np.std(predictions, axis=0)
+        
+        return {
+            "mean": mean_preds,
+            "std": std_preds
+        }
 

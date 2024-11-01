@@ -12,6 +12,9 @@ from torch.utils.data import Dataset, DataLoader
 import hashlib
 import pandas as pd
 from egfr_binder_rd2.utils import hash_seq
+from typing import List, Dict, Optional
+import numpy as np
+from dataclasses import dataclass
 
 # Utility functions
 def create_pairwise_comparisons(batch, outputs, label):
@@ -258,3 +261,56 @@ class BTRegressionModule(pl.LightningModule):
         model.current_run_path = f'{artifact.entity}/{artifact.project}/{artifact.source_name}'
 
         return model
+
+@dataclass
+class EnsembleMember:
+    model: BTRegressionModule
+    validation_score: float
+    seed: int
+
+class BTEnsemble:
+    def __init__(self, n_models: int = 5):
+        self.n_models = n_models
+        self.members: List[EnsembleMember] = []
+        
+    def add_member(self, model: BTRegressionModule, validation_score: float, seed: int):
+        self.members.append(EnsembleMember(model, validation_score, seed))
+        
+    def predict(self, sequences: List[str], batch_size: int = 32) -> Dict[str, np.ndarray]:
+        """Get predictions and uncertainties using ensemble"""
+        all_predictions = []
+        
+        # Get predictions from each model
+        for member in self.members:
+            preds = member.model.predict_sequences(sequences, batch_size)
+            all_predictions.append(preds)
+            
+        # Convert to numpy array for calculations
+        predictions = np.array(all_predictions)
+        
+        # Calculate mean and std across ensemble members
+        mean_pred = np.mean(predictions, axis=0)
+        std_pred = np.std(predictions, axis=0)
+        
+        return {
+            "mean": mean_pred,
+            "std": std_pred,
+            "raw_predictions": predictions
+        }
+
+    def save(self, save_dir: str):
+        """Save all ensemble members"""
+        for i, member in enumerate(self.members):
+            save_path = f"{save_dir}/ensemble_member_{i}.pt"
+            member.model.save_adapter(save_path)
+            
+    @classmethod
+    def load(cls, load_dir: str, n_models: int) -> 'BTEnsemble':
+        """Load ensemble from directory"""
+        ensemble = cls(n_models=n_models)
+        for i in range(n_models):
+            load_path = f"{load_dir}/ensemble_member_{i}.pt"
+            model = BTRegressionModule.load_adapter(load_path)
+            # Note: We'll need to recompute validation scores if needed
+            ensemble.add_member(model, 0.0, i)  
+        return ensemble
