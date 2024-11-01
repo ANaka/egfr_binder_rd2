@@ -7,10 +7,11 @@ requires-python = ">=3.11"
 dependencies = [
     "biopython==1.81",
     "biotite>=1.0.1",
+    "evo-prot-grad>=0.2",
     "ipykernel>=6.29.5",
     "modal>=0.64.232",
     "polaris-lib>=0.8.6",
-    "transformers>=4.46.0",
+    "transformers>=4.38.0",
     "wandb>=0.18.5",
 ]
 

@@ -1,47 +1,49 @@
 import os
 import subprocess
 import logging
-import io
-import re
 import json
 from datetime import datetime
-
-from modal import Image, App, method, enter, Dict, Volume, Mount
-
+from pathlib import Path
+import tempfile
+from typing import List, Union
+from modal import Image, App, method, enter, Dict, Volume, Mount, interact
 from egfr_binder_rd2 import (
-    TEMPLATE_A3M_PATH, 
     EGFS, 
     EGFR, 
     COLABFOLD_GPU_CONCURRENCY_LIMIT, 
-    FOLD_RESULTS_DIR, 
-    MODAL_VOLUME_NAME
+    MODAL_VOLUME_NAME,
+    MSA_QUERY_HOST_URL,
+    OUTPUT_DIRS,
+    LOGGING_CONFIG,
+    MODAL_VOLUME_PATH
 )
-from egfr_binder_rd2.utils import get_mutation_diff, hash_seq
+from egfr_binder_rd2.utils import (
+    get_mutation_diff, 
+    hash_seq,
+    get_fasta_path,
+    get_folded_dir,
+    swap_binder_seq_into_a3m
+)
+import io
+import numpy as np
+import pandas as pd
+import re
 
+
+EGFR_EPITOPE_RESIDUES = [11, 12, 13, 15, 16, 17, 18, 356, 440, 441]
+INTERACTION_CUTOFF = 4.0  # Angstroms
 
 # Define constants for the modal volume path
-MODAL_VOLUME_PATH = "/data"
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Set up logging using configuration
+logging.basicConfig(level=LOGGING_CONFIG["level"], format=LOGGING_CONFIG["format"])
 logger = logging.getLogger(__name__)
 
-app = App("colabfold")
+app = App("simplefold")
 
 # Initialize the Volume
 volume = Volume.from_name(MODAL_VOLUME_NAME, create_if_missing=True)
-
-# Create a mount for the template file
-template_mount = Mount.from_local_dir(
-    local_path=os.path.dirname(TEMPLATE_A3M_PATH),
-    remote_path="/root/templates"
-)
-
-# Update the template path constant to use the mounted path
-MOUNTED_TEMPLATE_PATH = os.path.join(
-    "/root/templates", 
-    os.path.basename(TEMPLATE_A3M_PATH)
-)
 
 image = (
     Image
@@ -49,10 +51,9 @@ image = (
     .micromamba(python_version="3.11")
     .apt_install("wget", "git", "curl")
     .run_commands('wget https://raw.githubusercontent.com/YoshitakaMo/localcolabfold/main/install_colabbatch_linux.sh')
-    .run_commands('bash install_colabbatch_linux.sh', gpu="a100",)
-    # Update the pip installations to use biopython instead of Bio
+    .run_commands('bash install_colabbatch_linux.sh', gpu="a100")
     .pip_install(
-        'biopython==1.81',  # Specify version for consistency
+        'biopython==1.81',
         'pandas',
         'numpy'
     )
@@ -62,57 +63,17 @@ with image.imports():
     from Bio import PDB
     import numpy as np
     import pandas as pd
+    from Bio.PDB import PDBParser, NeighborSearch
+    from Bio.PDB import Selection
+    from Bio.PDB.Polypeptide import is_aa
 
-def generate_a3m_files(
-    binder_sequences, 
-    output_folder="/data/input_a3m", 
-    template_a3m_path=MOUNTED_TEMPLATE_PATH,  # Updated default path
-    target_a3m_path=None,  # New optional parameter
-    target_sequence=None
-):
-    os.makedirs(output_folder, exist_ok=True)
-    
-    # Load template A3M
-    with open(template_a3m_path, 'r') as template_file:
-        template_lines = template_file.readlines()
-    
-    # Load target A3M if provided
-    if target_a3m_path:
-        with open(target_a3m_path, 'r') as target_file:
-            target_lines = target_file.readlines()
-        target_sequence = ''.join([line.strip() for line in target_lines if not line.startswith('#') and not line.startswith('>')])
-    else:
-        # Extract the target sequence from the template if target_sequence is None
-        if target_sequence is None:
-            template_sequence = template_lines[2].strip()
-            binder_length = int(template_lines[0].split(',')[0].strip('#'))
-            target_sequence = template_sequence[binder_length:]
-    
-    for name, binder_seq in binder_sequences.items():
-        output_path = os.path.join(output_folder, f"{name}.a3m")
-        
-        with open(output_path, 'w') as output_file:
-            # Write the header lines from template
-            output_file.writelines(template_lines[:2])
-            
-            # Write the binder sequence (if provided) and target sequence
-            if binder_seq:
-                output_file.write(f"{binder_seq}{target_sequence}\n")
-            else:
-                output_file.write(f"{target_sequence}\n")
-            
-            # Write the rest of the template file
-            output_file.writelines(template_lines[3:])
-    
-    return output_folder
 
 @app.cls(
     image=image,
-    gpu='a100',
+    gpu="A10G",
     timeout=9600,
     concurrency_limit=COLABFOLD_GPU_CONCURRENCY_LIMIT,
     volumes={MODAL_VOLUME_PATH: volume},
-    mounts=[template_mount]
 )
 class LocalColabFold:
     @staticmethod
@@ -131,19 +92,10 @@ class LocalColabFold:
         os.environ["PATH"] = "/localcolabfold/colabfold-conda/bin:" + os.environ["PATH"]
 
     @method()
-    def fold(self, binder_sequences, template_a3m_path, target_a3m_path=None, target_sequence=None,  **kwargs):
-        input_path = generate_a3m_files(
-            binder_sequences=binder_sequences,
-            output_folder=MODAL_VOLUME_PATH,
-            template_a3m_path=template_a3m_path,
-            target_a3m_path=target_a3m_path,
-            target_sequence=target_sequence
-        )
-        logger.info(f"Generated A3M files in: {input_path}")
-
-        out_dir = MODAL_VOLUME_PATH  # Using Volume path
-        os.makedirs(out_dir, exist_ok=True)
-        logger.info(f"Created output directory: {out_dir}")
+    def colabfold_batch(self, input_path, out_dir, **kwargs):
+        # Convert Path objects to strings
+        input_path = str(input_path)
+        out_dir = str(out_dir)
 
         cmd = ["colabfold_batch", input_path, out_dir]
         
@@ -155,9 +107,6 @@ class LocalColabFold:
                     cmd.append(f"--{key}")
             elif value is not None:
                 cmd.extend([f"--{key}", str(value)])
-                
-        # Removed the zip flag
-        # cmd.append('--zip')
         
         logger.info(f"Running command: {' '.join(cmd)}")
         
@@ -167,71 +116,8 @@ class LocalColabFold:
         except subprocess.CalledProcessError as e:
             logger.error(f"Command failed with error: {e}")
             logger.error(f"Error output: {e.stderr}")
-            raise
+        volume.commit()
         
-        logger.info(f'input directory contents: {os.listdir(input_path)}')
-        logger.info(f"Output directory contents: {os.listdir(out_dir)}")
-        logger.info(f'current directory contents: {os.listdir(".")}')
-        
-        # Directly process the output directory
-        all_results = self.extract_metrics_and_pdbs(out_dir)
-        logger.info(f"Extracted {len(all_results)} results")
-        
-        return all_results
-    
-    @method()
-    def raw_fold(self, sequences,  **kwargs):
-        
-        # Create a temporary directory for the FASTA file
-        temp_dir = os.path.join(MODAL_VOLUME_PATH, "temp_fasta")
-        os.makedirs(temp_dir, exist_ok=True)
-        input_path = os.path.join(temp_dir, "sequences.fasta")
-
-        # Write sequences to FASTA file
-        with open(input_path, "w") as f:
-            for name, seq in sequences.items():
-                f.write(f">{name}\n{seq}\n")
-        
-        logger.info(f"Wrote sequences to temporary FASTA file: {input_path}")
-
-        out_dir = MODAL_VOLUME_PATH  # Using Volume path
-        os.makedirs(out_dir, exist_ok=True)
-        logger.info(f"Created output directory: {out_dir}")
-
-        cmd = ["colabfold_batch", input_path, out_dir]
-        
-        # Handle arguments
-        for key, value in kwargs.items():
-            key = key.replace('_', '-')
-            if isinstance(value, bool):
-                if value:
-                    cmd.append(f"--{key}")
-            elif value is not None:
-                cmd.extend([f"--{key}", str(value)])
-                
-        # Removed the zip flag
-        # cmd.append('--zip')
-        
-        logger.info(f"Running command: {' '.join(cmd)}")
-        
-        try:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            logger.info(f"Command output: {result.stdout}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Command failed with error: {e}")
-            logger.error(f"Error output: {e.stderr}")
-            raise
-        
-        logger.info(f'input directory contents: {os.listdir(input_path)}')
-        logger.info(f"Output directory contents: {os.listdir(out_dir)}")
-        logger.info(f'current directory contents: {os.listdir(".")}')
-        
-        # Directly process the output directory
-        all_results = self.extract_metrics_and_pdbs(out_dir)
-        logger.info(f"Extracted {len(all_results)} results")
-        
-        return all_results
-
     @staticmethod
     def extract_sequence_from_pdb(pdb_content):
         parser = PDB.PDBParser(QUIET=True)
@@ -250,260 +136,707 @@ class LocalColabFold:
             'binder': sequences.get('A', ''),
             'target': sequences.get('B', ''),
         }
-    
-    @staticmethod
-    def extract_metrics_and_pdbs(output_dir):
-        logger.info(f"Processing metrics and PDBs in {output_dir}")
-        all_results = []
-        pdbs = {}
-        
-        for filename in os.listdir(output_dir):
-            if filename.endswith('.pdb'):
-                pdb_path = os.path.join(output_dir, filename)
-                
-                # Derive the JSON filename by replacing '_unrelaxed_' with '_scores_' and changing the extension
-                json_filename = filename.replace('_unrelaxed_', '_scores_').replace('.pdb', '.json')
-                json_path = os.path.join(output_dir, json_filename)
-                
-                if not os.path.exists(json_path):
-                    logger.warning(f"Missing JSON file for PDB: {json_filename}")
-                    continue
-                
-                # Read and process the PDB file
-                with open(pdb_path, 'r') as pdb_file:
-                    pdb_content = pdb_file.read()
-                    sequences = LocalColabFold.extract_sequence_from_pdb(pdb_content)
-                
-                # Read and process the JSON scores file
-                with open(json_path, 'r') as json_file:
-                    data = json.load(json_file)
-                    
-                    plddt_array = np.array(data.get('plddt', []))
-                    pae_array = np.array(data.get('pae', []))
-                    
-                    # Extract model number safely
-                    rank_match = re.search(r'rank_(\d+)', filename)
-                    model_number = int(rank_match.group(1)) if rank_match else 0
-                    
-                    binder_seq = sequences.get('binder', '')
-                    binder_length = len(binder_seq)  # **Dynamic binder_length per result**
-                    target_length = len(sequences.get('target', ''))
-                    
-                    pae_interaction = 0
-                    if pae_array.size:
-                        # Ensure that the pae array dimensions accommodate dynamic binder lengths
-                        if pae_array.shape[0] >= binder_length and pae_array.shape[1] >= binder_length:
-                            pae_interaction = (pae_array[binder_length:, :binder_length].mean() + pae_array[:binder_length, binder_length:].mean()) / 2
-                        else:
-                            logger.warning(f"PAE array shape {pae_array.shape} does not match binder_length {binder_length}")
-                    
-                    binder_plddt = plddt_array[:binder_length].mean() if plddt_array.size else 0
-                    binder_pae = pae_array[:binder_length, :binder_length].mean() if pae_array.size else 0
-                    
-                    result = {
-                        'seq_name': filename.split('_unrelaxed_rank')[0],
-                        'binder_sequence': binder_seq,
-                        'target_sequence': sequences.get('target', ''),
-                        'binder_length': binder_length,
-                        'target_length': target_length,
-                        'model_number': model_number,  # Use the safely extracted model number
-                        'binder_plddt': float(binder_plddt),
-                        'binder_pae': float(binder_pae),
-                        'pae_interaction': float(pae_interaction),
-                        'ptm': data.get('ptm', 0),
-                        'i_ptm': data.get('iptm', 0),
-                        'seq_id': hash_seq(sequences.get('binder', '')),
-                        'pdb_content': pdb_content
-                    }
-                    all_results.append(result)
-                    pdbs[f"{filename}_model_{result['model_number']}"] = pdb_content
 
-                    logger.info(f"Processed PDB and scores for {filename}_model_{result['model_number']}")
+    def extract_metrics(self, structure_path: Path) -> dict:
+        """Extract folding metrics from the structure file."""
+        # Implement actual metric extraction logic here
+        # Placeholder implementation:
+        return {
+            "pLDDT": 85.0,
+            "i_PAE": 10.0,
+            "i_pTM": 0.8
+        }
+
+@app.cls(
+    image=image,
+    gpu="A10G",  # A10G should be sufficient for MSA generation
+    volumes={MODAL_VOLUME_PATH: volume},
+    timeout=9600,
+)
+class MSAQuery:
+
+    @enter()
+    def setup(self):
+        os.environ["PATH"] = "/localcolabfold/colabfold-conda/bin:" + os.environ["PATH"]
+
+    @method()
+    def save_sequences_as_fasta(self, sequences: list[str]) -> Path:
+        """Save sequences to a FASTA file, using sequence hashes as headers."""
+        fasta_path = get_fasta_path(sequences)
+        fasta_path = Path(MODAL_VOLUME_PATH) / fasta_path
         
-        logger.info(f"Extracted {len(all_results)} total results and {len(pdbs)} PDB files")
-        return all_results
+        # Create parent directories if they don't exist
+        fasta_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write sequences to FASTA
+        with open(fasta_path, "w") as f:
+            for seq in sequences:
+                seq_hash = hash_seq(seq)
+                f.write(f">{seq_hash}\n{seq}\n")
+        
+        logger.info(f"Saved {len(sequences)} sequences to {fasta_path}")
+        return fasta_path
+
+    @method()
+    def query_msa_server(self, input_path: str | Path, out_dir: str | Path, host_url=MSA_QUERY_HOST_URL):
+        """Query the MSA server to generate alignments."""
+        # Convert paths to Path objects
+        input_path = Path(input_path)
+        out_dir = Path(out_dir)
+        
+        # Get expected output a3m path
+        a3m_path = out_dir / f"{input_path.stem}.a3m"
+        
+        # Check if MSA already exists
+        if a3m_path.exists():
+            logger.info(f"Found existing MSA at {a3m_path}")
+            return a3m_path
+        
+        # Create output directory if it doesn't exist
+        out_dir.mkdir(parents=True, exist_ok=True)
+        
+        cmd = [
+            "colabfold_batch",
+            str(input_path),
+            str(out_dir),
+            "--msa-only",
+            "--host-url", host_url
+        ]
+        
+        logger.info(f"Querying MSA server with command: {' '.join(cmd)}")
+        
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info(f"MSA generation output: {result.stdout}")
+
+            a3m_path = out_dir / f"{input_path.stem}.a3m"
+            return a3m_path
+        except subprocess.CalledProcessError as e:
+            logger.error(f"MSA generation failed with error: {e}")
+            logger.error(f"Error output: {e.stderr}")
+            raise
+
+    @method()
+    def run_msa_generation(self, sequences: List[str]) -> List[Path]:
+        """Run complete MSA generation pipeline for multiple sequences.
+        
+        Args:
+            sequences: List of sequences to process (each can be single sequence or paired like 'seq1:seq2')
+            
+        Returns:
+            List of paths to generated MSA files
+        """
+        fasta_path = self.save_sequences_as_fasta.remote(sequences)
+        out_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        
+        # query_msa_server returns a single a3m path, not a directory
+        a3m_path = self.query_msa_server.remote(fasta_path, out_dir)
+        return [a3m_path]  # Return as list to maintain interface
+
 
 @app.function(
-    timeout=4800,
+    image=image,
+    timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
-    mounts=[template_mount]
 )
-def fold_and_extract(
-    binder_sequences: dict, 
-    template_a3m_path: str = MOUNTED_TEMPLATE_PATH,  # Use the mounted path
-    target_a3m_path: str = None,  # New optional parameter
-    target_sequence: str = None, 
-    **kwargs
-):
-    lcf = LocalColabFold()
-    result = lcf.fold.remote(
-        binder_sequences=binder_sequences,
-        template_a3m_path=template_a3m_path,
-        target_a3m_path=target_a3m_path,  # Pass the target A3M path
-        target_sequence=target_sequence,
-        **kwargs
-    )
-    return result  # Now returns a list of results
+def get_msa_for_binder(binder_seqs: List[str], target_seq: str=EGFR) -> List[Path]:
+    """Get the MSA results for given binder sequences.
+    
+    Args:
+        binder_seqs: List of binder sequences to process
+        target_seq: Target sequence to pair with each binder
+        
+    Returns:
+        List of paths to generated MSA files
+    """
+    paired_seqs = [f'{binder}:{target_seq}' for binder in binder_seqs]
+    msa = MSAQuery()
+    return msa.run_msa_generation.remote(paired_seqs)
+
+
 
 @app.function(
-    timeout=12800,
+    image=image,
+    timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
-    mounts=[template_mount]
 )
-def raw_fold(input_path, **kwargs):
-    lcf = LocalColabFold()
-    return lcf.raw_fold.remote(input_path, **kwargs)
+def fold(input_path:str, num_models:int=1, num_recycle:int=1) -> Path:
+    """Run folding on a directory containing MSA results."""
+    # Ensure paths are within Modal volume
+    input_path = Path(MODAL_VOLUME_PATH) / input_path
+    output_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    
+    # Create output directory if it doesn't exist
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    
+    colabfold = LocalColabFold()
+    
+    logger.info(f"Starting folding for MSA results in {input_path}")
+    return colabfold.colabfold_batch.remote(input_path, output_dir, num_models=num_models, num_recycle=num_recycle)
+
+
+@app.local_entrypoint()
+def test_fold():
+    """Test the folding functionality."""
+    fold.remote('msa_results/5b353a/5b353a.a3m')
+
+
+@app.local_entrypoint()
+def test_msa_server_query():
+    """Test the MSA server query functionality."""
+    test_sequences = [
+        f'{EGFS}:{EGFR}',
+        # Add more test sequences as needed
+    ]
+
+    msa = MSAQuery()
+    result_files = msa.run_msa_generation.remote(test_sequences)
+    print(f"MSA results saved to: {[str(p) for p in result_files]}")
+
+def get_a3m_path(binder_seq: str, target_seq: str) -> Path:
+    seq_hash = hash_seq(f'{binder_seq}:{target_seq}')
+    return Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"] / f"{seq_hash}.a3m"
+
+
+def a3m_from_template(binder_seqs: List[str], parent_binder_seqs: List[str], target_seq: str=EGFR) -> List[Path]:
+    """Get the a3m file paths for given binder sequences using their parent sequences as templates.
+    
+    Args:
+        binder_seqs: List of binder sequences to process
+        parent_binder_seqs: List of parent sequences to use as templates (must match length of binder_seqs)
+        target_seq: Target sequence to pair with each binder
+        
+    Returns:
+        List of paths to generated a3m files
+    """
+    assert len(binder_seqs) == len(parent_binder_seqs), "Must provide same number of binder and parent sequences"
+    result_paths = []
+    
+    for binder_seq, parent_binder_seq in zip(binder_seqs, parent_binder_seqs):
+        assert len(binder_seq) == len(parent_binder_seq), "Binder and parent sequences must be the same length"
+        
+        a3m_path = get_a3m_path(binder_seq=binder_seq, target_seq=target_seq)
+        lineage_json_path = a3m_path.with_suffix('.lineage.json')
+        
+        if a3m_path.exists():
+            logger.info(f"Found existing MSA at {a3m_path}")
+            if not lineage_json_path.exists():
+                # Record lineage information
+                lineage_info = {
+                    'seq_hash': hash_seq(f'{binder_seq}:{target_seq}'),
+                    'parent_hash': hash_seq(f'{parent_binder_seq}:{target_seq}'),
+                    'binder_seq': binder_seq,
+                    'parent_seq': parent_binder_seq,
+                    'target_seq': target_seq,
+                    'mutations': get_mutation_diff(parent_binder_seq, binder_seq),
+                    'timestamp': datetime.now().isoformat()
+                }
+                with open(lineage_json_path, 'w') as f:
+                    json.dump(lineage_info, f, indent=2)
+        else:
+            template_a3m_path = get_a3m_path(binder_seq=parent_binder_seq, target_seq=target_seq)
+            
+            # Record lineage information
+            lineage_info = {
+                'seq_hash': hash_seq(f'{binder_seq}:{target_seq}'),
+                'parent_hash': hash_seq(f'{parent_binder_seq}:{target_seq}'),
+                'binder_seq': binder_seq,
+                'parent_seq': parent_binder_seq,
+                'mutations': get_mutation_diff(parent_binder_seq, binder_seq),
+                'timestamp': datetime.now().isoformat()
+            }
+            with open(lineage_json_path, 'w') as f:
+                json.dump(lineage_info, f, indent=2)
+            
+            a3m_path = swap_binder_seq_into_a3m(binder_seq=binder_seq, template_a3m_path=template_a3m_path, output_path=a3m_path)
+        
+        result_paths.append(a3m_path)
+    
+    return result_paths
+
 
 @app.function(
-    timeout=12800,
+    image=image,
+    timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
-    mounts=[template_mount]
 )
-def parallel_fold_and_extract(
-    binder_sequences: dict, 
-    template_a3m_path: str = None, 
-    target_a3m_path: str = None,  # New optional parameter
-    target_sequence: str = None,  # New optional parameter
-    batch_size: int = 10,
-    **kwargs
-):
-    if template_a3m_path is None:
-        template_a3m_path = MOUNTED_TEMPLATE_PATH  # Use the mounted path
+def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[str, List[str]]=None, target_seq: str=EGFR) -> List[Path]:
+    """Fold one or more mutated binder sequences."""
+    # Convert single sequences to lists for consistent handling
+    if isinstance(binder_seqs, str):
+        binder_seqs = [binder_seqs]
+    if isinstance(parent_binder_seqs, str):
+        parent_binder_seqs = [parent_binder_seqs] * len(binder_seqs)
+    elif parent_binder_seqs is not None and len(parent_binder_seqs) == 1:
+        parent_binder_seqs = parent_binder_seqs * len(binder_seqs)
     
-    lcf = LocalColabFold()
-    all_results = []
+    logger.info(f"Folding sequences: {binder_seqs}")
+    logger.info(f"Using parent sequences: {parent_binder_seqs}")
     
-    # Prepare batches
-    batches = []
-    for i in range(0, len(binder_sequences), batch_size):
-        batch = dict(list(binder_sequences.items())[i:i+batch_size])
-        batches.append((batch, template_a3m_path, target_a3m_path, target_sequence))
+    # First, ensure we have MSAs for all sequences
+
+    # If parent sequences match binder sequences exactly, generate new MSAs
+    if binder_seqs == parent_binder_seqs:
+        logger.info("Binder sequences match parent sequences, generating new MSAs")
+        a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
+    else:
+        logger.info("Using template MSAs from parent sequences")
+        a3m_paths = a3m_from_template(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
+
+    logger.info(f"Generated a3m paths: {a3m_paths}")
+    volume.commit()
+    logger.info("Committed volume")
+
+    volume.reload()
+    logger.info("Reloaded volume")
     
-    all_results = []
-    for result in lcf.fold.starmap(batches, kwargs=kwargs):
-        all_results.extend(result)
+    # Check that all a3m files exist
+    missing_files = [path for path in a3m_paths if not path.exists()]
+    if missing_files:
+        logger.error(f"MSA files not found after generation attempt: {missing_files}")
+        raise FileNotFoundError(f"MSA generation failed for: {missing_files}")
+
+    # Initialize ColabFold instance
+    colabfold = LocalColabFold()
+    output_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Fold all sequences
+    folded_paths = []
+    for a3m_path in a3m_paths:
+        logger.info(f"Starting fold for {a3m_path}")
+        try:
+            # Get sequence hash from a3m path
+            seq_hash = a3m_path.stem
+            
+            # Run folding
+            colabfold.colabfold_batch.remote(a3m_path, output_dir, num_models=1, num_recycle=1)
+            
+            volume.commit()
+            logger.info("Committed volume")
+            
+            volume.reload()
+            logger.info("Reloaded volume")
+            
+            # Look for the scores files
+            logger.info(f"Searching for scores files with pattern: {seq_hash}_scores*.json")
+            scores_files = list(output_dir.glob(f"{seq_hash}_scores*.json"))
+            
+            if not scores_files:
+                logger.error(f"No scores files found for {seq_hash} in {output_dir}")
+                # List all files in output directory for debugging
+                raise FileNotFoundError(f"No scores files found for {seq_hash}")
+            
+            # Extract metrics from scores files
+            metrics = []
+            for scores_file in scores_files:
+                with open(scores_file, 'r') as f:
+                    data = json.load(f)
+                    
+                rank_match = re.search(r'rank_(\d+)', scores_file.name)
+                model_number = int(rank_match.group(1)) if rank_match else 0
+                
+                metrics.append({
+                    'seq_hash': seq_hash,
+                    'model_number': model_number,
+                    'plddt': np.mean(data.get('plddt', [])),
+                    'ptm': data.get('ptm', 0),
+                    'i_ptm': data.get('iptm', 0),
+                    'pae': np.mean(data.get('pae', [])) if data.get('pae') else None
+                })
+            
+            logger.info(f"Extracted metrics from {len(metrics)} models for {seq_hash}")
+            return metrics
+
+        except Exception as e:
+            logger.error(f"Folding failed for {a3m_path}: {str(e)}")
+            raise
     
-    return all_results
+    return folded_paths
 
-@app.local_entrypoint()
-def test():
-    # Use the mounted template path
-    template_a3m_path = MOUNTED_TEMPLATE_PATH
-    target_a3m_path = "/root/templates/custom_target.a3m"  # Example target A3M path
-    binder_sequences = {
-        "binder1": EGFS,
-    }
-    target_sequence = EGFR
-    results_a3m_with_target = fold_and_extract.remote(
-        template_a3m_path=template_a3m_path,
-        target_a3m_path=target_a3m_path,  # Pass the target A3M path
-        binder_sequences=binder_sequences,
-        target_sequence=target_sequence,
-        num_recycle=1,
-        num_models=1
-    )
 
-    # Test a3m-based folding without provided target sequence
-    results_a3m_without_target = fold_and_extract.remote(
-        template_a3m_path=template_a3m_path,
-        binder_sequences=binder_sequences,
-        num_recycle=1,
-        num_models=1
-    )
-
-@app.local_entrypoint()
-def manual_parallel_fold():
-    def mutate_seq(seq, position, new_aa):
-        return seq[:position-1] + new_aa + seq[position:]
-
-    def apply_mutation(seq, mutation_str):
-        new_aa = mutation_str[-1]
-        position = int(mutation_str[:-1])
-        return mutate_seq(seq, position, new_aa)
-
-    egfs = 'NSYPGCPSSYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWW'
-    seed = egfs
-    seed = 'PSYSGCPSSYDGYCGNGGVCMHIESLDSYTCQCVIGYSGDRVQTRDLRWT'
-    seed = 'ISYSACPLSYDGVCGNGGVCKHALSLDSYTCQCVWGYSGDRVQTRDLRYT'
-
-    mutations = []
-    for pos in range(7, 50):
-        mutations.append(f'{pos}A')
-    seqs = {}
-    for mutation in mutations:
-        seq = apply_mutation(seed, mutation)
-        seqs[hash_seq(seq)] = seq
+def calc_percentage_charged(sequence: str) -> float:
+    """Calculate the percentage of charged amino acids in a sequence.
+    
+    Args:
+        sequence: Amino acid sequence string
         
-    # Use the mounted template path
-    template_a3m_path = MOUNTED_TEMPLATE_PATH
-    results = list(parallel_fold_and_extract.remote(
-        binder_sequences=seqs, 
-        batch_size=3, 
-        num_recycle=1, 
-        num_models=1
-    ))
-    fold_df = pd.DataFrame(results)
-    fold_df['mut_str'] = fold_df['binder_sequence'].apply(get_mutation_diff, seq2=EGFS)
-    fold_df['seq_name'] = fold_df['binder_sequence'].apply(hash_seq)
-    now = datetime.now().strftime('%Y%m%d_%H%M%S')
-    fp = FOLD_RESULTS_DIR / f'fold_results_{now}.csv'
-    # save the fold_df
-    fold_df.to_csv(fp, index=False)
-    
-@app.local_entrypoint()
-def manual_parallel_fold_validate():
-    seed = 'ISYSACPLSYDGVCGNGGVCKHALSLDSYTCQCVWGYSGDRVQTRDLRYT'
+    Returns:
+        float: Fraction of sequence that is charged (R,K,H,D,E)
+    """
+    charged = set('RKHDE')
+    return sum(1 for aa in sequence if aa in charged) / len(sequence)
 
-    seqs = {}
-    seqs[hash_seq(seed)] = seed
+def calc_percentage_hydrophobic(sequence: str) -> float:
+    """Calculate the percentage of hydrophobic amino acids in a sequence.
+    
+    Args:
+        sequence: Amino acid sequence string
         
-    # Use the mounted template path
-    template_a3m_path = MOUNTED_TEMPLATE_PATH
-    results = list(parallel_fold_and_extract.remote(
-        binder_sequences=seqs, 
-        batch_size=3, 
-        num_recycle=3, 
-        num_models=5
-    ))
-    fold_df = pd.DataFrame(results)
-    fold_df['mut_str'] = fold_df['binder_sequence'].apply(get_mutation_diff, seq2=EGFS)
-    fold_df['seq_name'] = fold_df['binder_sequence'].apply(hash_seq)
-    now = datetime.now().strftime('%Y%m%d_%H%M%S')
-    fp = FOLD_RESULTS_DIR / f'fold_results_{now}.csv'
-    # save the fold_df
-    fold_df.to_csv(fp, index=False)
+    Returns:
+        float: Fraction of sequence that is hydrophobic (V,I,L,M,F,Y,W)
+    """
+    hydrophobic = set('VILMFYW')
+    return sum(1 for aa in sequence if aa in hydrophobic) / len(sequence)
+
+def get_metrics_from_hash(seq_hash: str) -> dict:
+    """Extract metrics from folding results for a given sequence hash."""
+    folded_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    
+    # Add check for lineage information
+    msa_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
+    lineage_path = msa_dir / f"{seq_hash}.lineage.json"
+    
+    # Load lineage info if available
+    parent_info = {}
+    if lineage_path.exists():
+        with open(lineage_path, 'r') as f:
+            lineage_data = json.load(f)
+            parent_info = {
+                'parent_hash': lineage_data.get('parent_hash'),
+                'parent_sequence': lineage_data.get('parent_seq'),
+                'mutations': lineage_data.get('mutations')
+            }
+    
+    # Find relevant files
+    base_pattern = f"{seq_hash}_*"
+    scores_files = list(folded_dir.glob(f"{base_pattern}scores*.json"))
+    pdb_files = list(folded_dir.glob(f"{base_pattern}unrelaxed*.pdb"))
+    
+    if not scores_files or not pdb_files:
+        logger.warning(f"Missing results files for hash {seq_hash}")
+        return None
+        
+    results = []
+    for pdb_path in pdb_files:
+        # Find corresponding scores file
+        scores_path = pdb_path.with_name(pdb_path.name.replace('_unrelaxed_', '_scores_')).with_suffix('.json')
+        
+        if not scores_path.exists():
+            continue
+            
+        with open(pdb_path, 'r') as pdb_file:
+            pdb_content = pdb_file.read()
+            sequences = LocalColabFold.extract_sequence_from_pdb(pdb_content)
+            
+        with open(scores_path, 'r') as json_file:
+            data = json.load(json_file)
+            
+            plddt_array = np.array(data.get('plddt', []))
+            pae_array = np.array(data.get('pae', []))
+            
+            rank_match = re.search(r'rank_(\d+)', pdb_path.name)
+            model_number = int(rank_match.group(1)) if rank_match else 0
+            
+            binder_seq = sequences.get('binder', '')
+            binder_length = len(binder_seq)
+            target_length = len(sequences.get('target', ''))
+            
+            # Calculate metrics
+            binder_plddt = float(plddt_array[:binder_length].mean()) if plddt_array.size else 0
+            binder_pae = float(pae_array[:binder_length, :binder_length].mean()) if pae_array.size else 0
+            
+            pae_interaction = 0
+            if pae_array.size:
+                if pae_array.shape[0] >= binder_length and pae_array.shape[1] >= binder_length:
+                    pae_interaction = float((
+                        pae_array[binder_length:, :binder_length].mean() + 
+                        pae_array[:binder_length, binder_length:].mean()
+                    ) / 2)
+            
+            # Add epitope interaction analysis
+            parser = PDB.PDBParser(QUIET=True)
+            structure = parser.get_structure("protein", pdb_path)
+            
+            # Add sequence property metrics for the binder
+            binder_charged_fraction = calc_percentage_charged(binder_seq)
+            binder_hydrophobic_fraction = calc_percentage_hydrophobic(binder_seq)
+            
+            results.append({
+                'seq_hash': seq_hash,
+                'binder_sequence': binder_seq,
+                'binder_length': binder_length,
+                'target_sequence': sequences.get('target', ''),
+                'target_length': target_length,
+                'model_number': model_number,
+                'binder_plddt': binder_plddt,
+                'binder_pae': binder_pae,
+                'pae_interaction': pae_interaction,
+                'ptm': data.get('ptm', 0),
+                'i_ptm': data.get('iptm', 0),
+                'binder_charged_fraction': binder_charged_fraction,
+                'binder_hydrophobic_fraction': binder_hydrophobic_fraction,
+                'parent_hash': parent_info.get('parent_hash', None),
+                'parent_sequence': parent_info.get('parent_sequence', None),
+                'mutations': parent_info.get('mutations', None)
+            })
+    
+    return results
+
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def update_metrics_for_all_folded():
+    """Update metrics CSV with results from all folded structures, only processing new hashes."""
+    folded_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    metrics_file = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["metrics_csv"]
+    
+    # Create metrics directory if it doesn't exist
+    metrics_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load existing metrics if available
+    existing_df = pd.DataFrame()
+    existing_hashes = set()
+    if metrics_file.exists():
+        existing_df = pd.read_csv(metrics_file)
+        existing_hashes = set(existing_df['seq_hash'].unique())
+        logger.info(f"Found existing metrics for {len(existing_hashes)} sequence hashes")
+    
+    # Get all unique sequence hashes from folded files
+    all_files = list(folded_dir.glob("*_scores*.json"))
+    all_hashes = set(f.name.split('_')[0] for f in all_files)
+    
+    # Identify new hashes that need processing
+    new_hashes = all_hashes - existing_hashes
+    logger.info(f"Found {len(new_hashes)} new sequence hashes to process")
+    
+    if not new_hashes:
+        logger.info("No new sequences to process")
+        return existing_df  # Return existing DataFrame instead of file path
+    
+    # Process new hashes
+    new_results = []
+    for seq_hash in new_hashes:
+        results = get_metrics_from_hash(seq_hash)
+        if results:
+            new_results.extend(results)
+    
+    if new_results:
+        # Convert new results to DataFrame
+        new_df = pd.DataFrame(new_results)
+        
+        # Combine with existing results
+        if not existing_df.empty:
+            df = pd.concat([existing_df, new_df], ignore_index=True)
+        else:
+            df = new_df
+        
+        # Save updated metrics
+        df.to_csv(metrics_file, index=False)
+        logger.info(f"Added metrics for {len(new_results)} new models, total {len(df)} entries")
+    else:
+        logger.info("No new valid results to add")
+        df = existing_df  # Use existing DataFrame if no new results
+    
+    return df
+
+
+# @app.function(
+#     image=image,
+#     timeout=9600,
+#     volumes={MODAL_VOLUME_PATH: volume},
+# )
+# def rebuild_substituted_a3ms() -> List[Path]:
+#     """Rebuild a3m files that were created by substitution, using the same parent templates
+#     but redoing the substitution process.
+    
+#     Returns:
+#         List[Path]: Paths to rebuilt a3m files
+#     """
+#     msa_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
+#     rebuilt_paths = []
+    
+#     # Find all lineage files
+#     lineage_files = list(msa_dir.glob("*.lineage.json"))
+#     logger.info(f"Found {len(lineage_files)} sequences with lineage information")
+    
+#     for lineage_file in lineage_files:
+#         try:
+#             with open(lineage_file, 'r') as f:
+#                 lineage_data = json.load(f)
+                
+#             binder_seq = lineage_data.get('binder_seq')
+#             parent_seq = lineage_data.get('parent_seq')
+            
+#             if not (binder_seq and parent_seq):
+#                 logger.warning(f"Missing sequence information in {lineage_file}")
+#                 continue
+            
+#             # Get paths
+#             parent_hash = hash_seq(f"{parent_seq}:{EGFR}")
+#             template_a3m_path = msa_dir / f"{parent_hash}.a3m"
+#             output_a3m_path = msa_dir / f"{lineage_file.stem.replace('.lineage', '')}.a3m"
+            
+#             if not template_a3m_path.exists():
+#                 logger.warning(f"Parent template not found: {template_a3m_path}")
+#                 continue
+                
+#             # Redo the substitution
+#             logger.info(f"Rebuilding {output_a3m_path}")
+#             rebuilt_path = swap_binder_seq_into_a3m(
+#                 binder_seq=binder_seq,
+#                 template_a3m_path=template_a3m_path,
+#                 output_path=output_a3m_path
+#             )
+#             rebuilt_paths.append(rebuilt_path)
+            
+#         except Exception as e:
+#             logger.error(f"Failed to process {lineage_file}: {str(e)}")
+#             continue
+    
+#     logger.info(f"Successfully rebuilt {len(rebuilt_paths)} a3m files")
+#     return rebuilt_paths
+
+# @app.local_entrypoint()
+# def do_rebuild():
+#     rebuild_substituted_a3ms.remote()
 
 @app.local_entrypoint()
-def quick_test():
-    # Use the mounted template path
-    template_a3m_path = MOUNTED_TEMPLATE_PATH
-    binder_sequences = {
-        "test_binder": "NSYPGCPSSYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWW",
-    }
+def benchmark_fold():
+    import time
+    logger.info("Starting benchmark fold")
+    start_time = time.time()
+
+    parent_binder_seq = 'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS'
+    binder_seqs = [
+        # 'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
+        # 'AERMRRRFEHIVEIHEEWAKEELENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
+        'AERMRRRFEHIVEIHEEWAKEVEENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS'
+        ]
+
+    logger.info("Calling fold_binder")
+    result = fold_binder.remote(binder_seqs=binder_seqs, parent_binder_seqs=[parent_binder_seq])
     
-    results = fold_and_extract.remote(
-        binder_sequences=binder_sequences,
-        template_a3m_path=template_a3m_path,  # Use the mounted path
-        num_recycle=1,
-        num_models=1
-    )
-    
-    print("Test Results:", results)
+    end_time = time.time()
+    duration = end_time - start_time
+    logger.info(f"Benchmark fold completed in {duration:.2f} seconds")
+
+    return result
 
 
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def parallel_fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[str, List[str]]=None, target_seq: str=EGFR) -> List[Path]:
+    """Fold multiple binder sequences in parallel."""
+    # Convert single sequences to lists for consistent handling
+    if isinstance(binder_seqs, str):
+        binder_seqs = [binder_seqs]
+    if isinstance(parent_binder_seqs, str):
+        parent_binder_seqs = [parent_binder_seqs] * len(binder_seqs)
+    elif parent_binder_seqs is not None and len(parent_binder_seqs) == 1:
+        parent_binder_seqs = parent_binder_seqs * len(binder_seqs)
+    
+    logger.info(f"Parallel folding {len(binder_seqs)} sequences")
+    
+
+    if binder_seqs == parent_binder_seqs:
+        logger.info("Binder sequences match parent sequences, generating new MSAs")
+        a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
+    else:
+        logger.info("Using template MSAs from parent sequences")
+        a3m_paths = a3m_from_template(binder_seqs=binder_seqs, parent_binder_seqs=parent_binder_seqs, target_seq=target_seq)
+
+    volume.commit()
+    volume.reload()
+    
+    # Check that all a3m files exist
+    missing_files = [path for path in a3m_paths if not path.exists()]
+    if missing_files:
+        raise FileNotFoundError(f"MSA generation failed for: {missing_files}")
+
+    # Initialize ColabFold instance
+    colabfold = LocalColabFold()
+    output_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create list of arguments for each folding task
+    # Each item should be a tuple of (a3m_path, output_dir)
+    folding_args = [(a3m_path, output_dir) for a3m_path in a3m_paths]
+    kwargs = {"num_models": 1, "num_recycle": 1}
+
+    # Run folding in parallel using starmap since we have multiple arguments
+    all_metrics = []
+    for result in colabfold.colabfold_batch.starmap(folding_args, kwargs=kwargs):
+        logger.info(f"Completed folding task with result: {result}")
+        
+        # Process results for this batch
+        for a3m_path in a3m_paths:
+            seq_hash = a3m_path.stem
+            scores_files = list(output_dir.glob(f"{seq_hash}_scores*.json"))
+            
+            if not scores_files:
+                logger.error(f"No scores files found for {seq_hash}")
+                continue
+                
+            metrics = []
+            for scores_file in scores_files:
+                with open(scores_file, 'r') as f:
+                    data = json.load(f)
+                    
+                rank_match = re.search(r'rank_(\d+)', scores_file.name)
+                model_number = int(rank_match.group(1)) if rank_match else 0
+                
+                metrics.append({
+                    'seq_hash': seq_hash,
+                    'model_number': model_number,
+                    'plddt': np.mean(data.get('plddt', [])),
+                    'ptm': data.get('ptm', 0),
+                    'i_ptm': data.get('iptm', 0),
+                    'pae': np.mean(data.get('pae', [])) if data.get('pae') else None
+                })
+            
+            all_metrics.extend(metrics)
+    
+    return all_metrics
+
+def generate_mutated_sequences(parent_seq: str, num_sequences: int = 10) -> list:
+    import random
+    """Generate sequences with single random mutations from parent sequence.
+    
+    Args:
+        parent_seq: Parent sequence to mutate
+        num_sequences: Number of sequences to generate
+        
+    Returns:
+        List of mutated sequences
+    """
+    amino_acids = 'ACDEFGHIKLMNPQRSTVWY'  # Standard amino acids
+    sequences = []
+    
+    for _ in range(num_sequences):
+        # Choose random position to mutate
+        pos = random.randint(0, len(parent_seq) - 1)
+        
+        # Choose random amino acid different from original
+        original_aa = parent_seq[pos]
+        new_aa = random.choice(amino_acids.replace(original_aa, ''))
+        
+        # Create mutated sequence
+        mutated_seq = parent_seq[:pos] + new_aa + parent_seq[pos + 1:]
+        sequences.append(mutated_seq)
+    
+    return sequences
 
 @app.local_entrypoint()
-def quick_test_raw():
-    s = 'SKEEEYYEEHQKLAKPVEELWEKLDELEKTGKLTGEHRPLVTEFRRLWSDAMVLIAMYMWYLEEVDKNPSEENRKKAQEYLEKVEEKKKEMEELLKKL'
+def benchmark_parallel_fold():
+    import time
+    logger.info("Starting parallel benchmark fold")
+    start_time = time.time()
 
+    parent_binder_seq = 'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS'
+    binder_seqs = generate_mutated_sequences(parent_binder_seq)
 
-    binder_sequences = {
-        hash_seq(s): f'{s}:{EGFR}'
-    }
+    logger.info("Calling parallel_fold_binder")
+    result = parallel_fold_binder.remote(binder_seqs=binder_seqs, parent_binder_seqs=[parent_binder_seq])
+    
+    end_time = time.time()
+    duration = end_time - start_time
+    logger.info(f"Parallel benchmark fold completed in {duration:.2f} seconds")
 
-    result = raw_fold.remote(
-        input_path=binder_sequences,
-        num_models=1, 
-        num_recycle=1,
-    )
-    print("Test Results:", result)
+    return result

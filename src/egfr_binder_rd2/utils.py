@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 from egfr_binder_rd2 import  OUTPUT_DIRS
+from egfr_binder_rd2 import EvolutionMetadata
 
 def hash_seq(sequence):
     """
@@ -103,7 +104,7 @@ def parse_fasta_lines(lines):
                 current_sequence = []
             
             # Start new sequence, store header without '>'
-            current_header = line[1:].split('\t')[0]  # Take first part before tab
+            current_header = line[1:]
         else:
             # Add sequence line
             current_sequence.append(line)
@@ -145,5 +146,11 @@ def swap_binder_seq_into_a3m(
             output_file.write(f"{seq}\n")
     
     return output_path
+
+def load_evolution_metadata(metadata_file: Path) -> EvolutionMetadata:
+    """Load evolution metadata from a JSON file"""
+    with open(metadata_file, "r") as f:
+        data = json.load(f)
+    return EvolutionMetadata(**data)
 
 
