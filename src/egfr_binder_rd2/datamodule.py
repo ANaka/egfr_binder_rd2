@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 import pandas as pd
 from typing import Optional
+import torch
+import numpy as np
 
 
 
@@ -41,79 +43,94 @@ class SequenceDataModule(LightningDataModule):
         self.y_ranks = None
         self.make_negative = make_negative
         
+        # Add new attributes to store split indices and DataFrames
+        self.train_indices = None
+        self.val_indices = None
+        self.test_indices = None
+        self.train_df = None
+        self.val_df = None
+        self.test_df = None
+        
     def setup(self, stage=None):
-        # Convert training DataFrame to Hugging Face Dataset
-        train_dataset = Dataset.from_pandas(self.df)
-        
-        if self.val_df is not None:
-            # Use provided validation split
-            val_dataset = Dataset.from_pandas(self.val_df)
-            test_dataset = val_dataset  # Use validation data as test set for simplicity
-        else:
-            # Perform random splits if validation data not provided
-            splits = train_dataset.train_test_split(test_size=self.test_size, seed=self.seed)
-            train_val = splits['train']
-            test_dataset = splits['test']
-            
-            splits = train_val.train_test_split(test_size=self.val_size, seed=self.seed)
-            train_dataset = splits['train']
-            val_dataset = splits['test']
+        # Initialize tokenizer if not already done
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
 
-        # Transform yvar based on specified method
-        if self.transform_type == 'standardize':
-            # Calculate mean and std of yvar from the training dataset only
-            self.y_mean = float(self.df[self.yvar].mean())
-            self.y_std = float(self.df[self.yvar].std())
-            
-            # Standardize all datasets using training statistics
-            def standardize(x):
-                return {self.yvar: (x[self.yvar] - self.y_mean) / self.y_std}
-            
-            train_dataset = train_dataset.map(standardize)
-            val_dataset = val_dataset.map(standardize)
-            test_dataset = test_dataset.map(standardize)
+        # First split the data into train/val/test
+        train_size = int(0.8 * len(self.df))
+        val_size = int(0.1 * len(self.df))
+        test_size = len(self.df) - train_size - val_size
         
-        elif self.transform_type == 'rank':
-            # Convert to ranks (0 to 1) for each dataset separately
-            def rank_transform(dataset):
-                ranks = pd.Series(dataset[self.yvar]).rank()
-                ranks = ranks / len(ranks)  # normalize to [0,1]
-                return dataset.map(
-                    lambda x, idx: {self.yvar: float(ranks.iloc[idx])},
-                    with_indices=True
-                )
-            
-            train_dataset = rank_transform(train_dataset)
-            val_dataset = rank_transform(val_dataset)
-            test_dataset = rank_transform(test_dataset)
+        splits = torch.utils.data.random_split(
+            self.df,
+            [train_size, val_size, test_size],
+            generator=torch.Generator().manual_seed(self.seed)
+        )
+        
+        # Store indices for each split
+        self.train_indices = splits[0].indices
+        self.val_indices = splits[1].indices
+        self.test_indices = splits[2].indices
+        
+        # Store DataFrames for each split
+        self.train_df = self.df.iloc[self.train_indices].copy()
+        self.val_df = self.df.iloc[self.val_indices].copy()
+        self.test_df = self.df.iloc[self.test_indices].copy()
+        
+        # Convert splits to datasets
+        train_dataset = Dataset.from_pandas(self.train_df)
+        val_dataset = Dataset.from_pandas(self.val_df)
+        test_dataset = Dataset.from_pandas(self.test_df)
 
-        if self.make_negative:
-            def negate(x):
+        # Combined transformation and tokenization function
+        def process_dataset(dataset):
+            def transform_and_tokenize(examples, indices):
+                results = {}
+                
+                # Transform y values
                 if self.transform_type == 'standardize':
-                    return {self.yvar: -1 * x[self.yvar]}
-                else:  # rank
-                    return {self.yvar: 1 - x[self.yvar]}
-                    
-            train_dataset = train_dataset.map(negate)
-            val_dataset = val_dataset.map(negate)
-            test_dataset = test_dataset.map(negate)
+                    # Convert list to numpy array for vectorized operations
+                    y_values = np.array(examples[self.yvar])
+                    standardized = (y_values - self.y_mean) / self.y_std
+                    results[self.yvar] = standardized.tolist()  # Convert back to list
+                elif self.transform_type == 'rank':
+                    ranks = pd.Series(dataset[self.yvar]).rank()
+                    normalized_ranks = ranks / len(ranks)
+                    results[self.yvar] = [float(normalized_ranks.iloc[i]) for i in indices]
+                
+                # Apply negation if required
+                if self.make_negative:
+                    if self.transform_type == 'standardize':
+                        results[self.yvar] = [-1 * y for y in results[self.yvar]]
+                    else:  # rank
+                        results[self.yvar] = [1 - y for y in results[self.yvar]]
+                
+                # Tokenization
+                tokenized = self.tokenizer(
+                    examples[self.xvar], 
+                    padding="max_length", 
+                    truncation=True, 
+                    max_length=self.max_length
+                )
+                results.update(tokenized)
+                
+                return results
 
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
-
-        # Tokenize function
-        def tokenize_function(examples):
-            return self.tokenizer(
-                examples[self.xvar], 
-                padding="max_length", 
-                truncation=True, 
-                max_length=self.max_length
+            return dataset.map(
+                transform_and_tokenize,
+                batched=True,
+                with_indices=True
             )
 
-        # Apply tokenization to all datasets
-        self.train_dataset = train_dataset.map(tokenize_function, batched=True)
-        self.val_dataset = val_dataset.map(tokenize_function, batched=True)
-        self.test_dataset = test_dataset.map(tokenize_function, batched=True)
+        # Calculate standardization parameters if needed
+        if self.transform_type == 'standardize':
+            self.y_mean = float(self.df[self.yvar].mean())
+            self.y_std = float(self.df[self.yvar].std())
+
+        # Process all datasets with a single map operation each
+        self.train_dataset = process_dataset(train_dataset)
+        self.val_dataset = process_dataset(val_dataset)
+        self.test_dataset = process_dataset(test_dataset)
 
         # Set the format to PyTorch tensors
         columns = ["input_ids", "attention_mask", self.yvar, self.xvar]
@@ -153,3 +170,21 @@ class SequenceDataModule(LightningDataModule):
             num_workers=4,
             pin_memory=True
         )
+
+    @property
+    def splits(self):
+        """Return a dictionary containing the split DataFrames"""
+        return {
+            'train': self.train_df,
+            'val': self.val_df,
+            'test': self.test_df
+        }
+    
+    @property
+    def indices(self):
+        """Return a dictionary containing the split indices"""
+        return {
+            'train': self.train_indices,
+            'val': self.val_indices,
+            'test': self.test_indices
+        }
