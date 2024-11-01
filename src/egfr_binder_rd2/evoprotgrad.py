@@ -281,18 +281,50 @@ def train_bt_model(
     test_preds = trainer.predict(model, data_module.test_dataloader())
 
     # Convert predictions and sequences to lists
-    train_df = pd.DataFrame({
-        'predictions': torch.cat([x['predictions'] for x in train_preds]).cpu().numpy(),
-        'sequence': [seq for batch in train_preds for seq in batch['sequence']],
-    })
-    val_df = pd.DataFrame({
-        'predictions': torch.cat([x['predictions'] for x in val_preds]).cpu().numpy(),
-        'sequence': [seq for batch in val_preds for seq in batch['sequence']],
-    })
-    test_df = pd.DataFrame({
-        'predictions': torch.cat([x['predictions'] for x in test_preds]).cpu().numpy(),
-        'sequence': [seq for batch in test_preds for seq in batch['sequence']],
-    })
+    def create_pred_df(predictions_list, name=""):
+        try:
+            # Validate predictions
+            if not predictions_list or any(x is None for x in predictions_list):
+                raise ValueError(f"Empty or None predictions in {name} set")
+                
+            # Validate prediction tensors and sequences
+            pred_tensors = []
+            sequences = []
+            for batch in predictions_list:
+                if 'predictions' not in batch or 'sequence' not in batch:
+                    raise ValueError(f"Missing predictions or sequence in {name} batch")
+                    
+                pred_tensor = batch['predictions'].view(-1, 1)
+                if not torch.is_tensor(pred_tensor) or pred_tensor.numel() == 0:
+                    raise ValueError(f"Invalid prediction tensor in {name} batch")
+                    
+                pred_tensors.append(pred_tensor)
+                sequences.extend(batch['sequence'])
+            
+            # Validate sequences are strings
+            if not all(isinstance(seq, str) for seq in sequences):
+                raise ValueError(f"Non-string sequences found in {name} set")
+                
+            # Create dataframe
+            df = pd.DataFrame({
+                'predictions': torch.cat(pred_tensors).cpu().numpy().squeeze(),
+                'sequence': sequences,
+            })
+            
+            # Add hash column only if sequences are valid
+            df['hash'] = df['sequence'].apply(lambda x: hash_seq(x) if isinstance(x, str) else None)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error creating {name} predictions dataframe: {str(e)}")
+            # Return empty dataframe with expected columns
+            return pd.DataFrame(columns=['predictions', 'sequence', 'hash'])
+
+    # Convert predictions and sequences to dataframes
+    train_df = create_pred_df(train_preds, "train") 
+    val_df = create_pred_df(val_preds, "validation")
+    test_df = create_pred_df(test_preds, "test")
 
     # Add sequence info and other metrics
     train_df[yvar] = data_module.train_dataset[yvar].numpy()
@@ -460,7 +492,7 @@ def train():
         wandb_entity="anaka_personal",
         model_name="facebook/esm2_t6_8M_UR50D",
         batch_size=32,
-        max_epochs=10,
+        max_epochs=3,
         learning_rate=1e-3,
         peft_r=8,
         peft_alpha=16,
