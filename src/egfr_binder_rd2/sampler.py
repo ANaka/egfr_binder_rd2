@@ -61,7 +61,7 @@ class DirectedEvolution:
         pae_model_path = self.train_bt_model.remote(
             yvar="pae_interaction",
             wandb_project="egfr-binder-rd2",
-            wandb_entity="anaka",
+            wandb_entity="anaka_personal",
             transform_type="rank",
             make_negative=True,
         )
@@ -301,6 +301,7 @@ class DirectedEvolution:
             for idx, row in top_sequences.iterrows():
                 logger.info(
                     f"Sequence {idx + 1}: "
+                    f"Length={len(row['binder_sequence'])}, "
                     f"Fitness={row['fitness']:.3f} "
                     f"(PLL_rank={row['sequence_log_pll_rank']:.3f}, "
                     f"iPAE_rank={row['pae_interaction_rank']:.3f}, "
@@ -324,9 +325,12 @@ class DirectedEvolution:
                 parent_metrics = top_sequences[top_sequences['binder_sequence'] == parent].iloc[0]
                 logger.info(
                     f"Parent {idx}: "
+                    f"Length={len(parent)}, "
                     f"PLL={parent_metrics['sequence_log_pll']:.2f}, "
                     f"PAE={parent_metrics['pae_interaction']:.2f}, "
-                    f"Fitness={parent_metrics['fitness']:.2f}"
+                    f"iPTM={parent_metrics['i_ptm']:.2f}, "
+                    f"Fitness={parent_metrics['fitness']:.2f}, "
+                    f"Sequence={parent}"
                 )
             
             # Store top sequences for final return
@@ -468,11 +472,11 @@ def main():
         n_parallel_chains=16,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
         n_steps=200,                  # Steps per chain
-        max_mutations=-1,             # Max mutations per sequence
-        evoprotgrad_top_fraction=0.2,
-        parent_selection_temperature=2.0,
-        sequence_sampling_temperature=2.0,
-        retrain_frequency=2,
+        max_mutations=5,             # Max mutations per sequence
+        evoprotgrad_top_fraction=0.25,
+        parent_selection_temperature=0.5,
+        sequence_sampling_temperature=0.5,
+        retrain_frequency=3,
         seed=42,
         select_from_current_gen_only=False,  # Add this parameter
     )
