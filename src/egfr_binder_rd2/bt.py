@@ -9,6 +9,9 @@ import wandb
 import os
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
+import hashlib
+import pandas as pd
+from egfr_binder_rd2.utils import hash_seq
 
 # Utility functions
 def create_pairwise_comparisons(batch, outputs, label):
@@ -45,6 +48,7 @@ class BTRegressionModule(pl.LightningModule):
         peft_r: int = 8,
         peft_alpha: int = 16,
         max_length: int = 512,
+        xvar: str = 'binder_sequence',
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -159,7 +163,18 @@ class BTRegressionModule(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         outputs = self(batch)
-        return outputs['predictions'].squeeze()
+        return {
+            'predictions': outputs['predictions'].squeeze(),
+            'sequence': batch[self.hparams.xvar],
+        }
+
+    @staticmethod
+    def _get_sequence_info(sequence):
+        """Calculate sequence length and hash."""
+        return {
+            'length': len(sequence),
+            'hash': hash_seq(sequence)
+        }
 
     def save_adapter(self, save_path):
         adapter_state_dict = get_peft_model_state_dict(self.esm_model)

@@ -45,7 +45,10 @@ class SequenceDataModule(LightningDataModule):
                                 with_indices=True)
 
         if self.make_negative:
-            dataset = dataset.map(lambda x: {self.yvar: -1 * x[self.yvar]})
+            if self.transform_type == 'standardize':
+                dataset = dataset.map(lambda x: {self.yvar: -1 * (x[self.yvar])})
+            elif self.transform_type == 'rank':
+                dataset = dataset.map(lambda x: {self.yvar: 1 - x[self.yvar]})
 
         # Split the dataset
         splits = dataset.train_test_split(test_size=self.test_size, seed=self.seed)
@@ -70,19 +73,40 @@ class SequenceDataModule(LightningDataModule):
         self.test_dataset = test.map(tokenize_function, batched=True)
 
         # Set the format to PyTorch tensors
-        columns = ["input_ids", "attention_mask", self.yvar]
+        columns = ["input_ids", "attention_mask", self.yvar, self.xvar]
         self.train_dataset.set_format(type="torch", columns=columns)
         self.val_dataset.set_format(type="torch", columns=columns)
         self.test_dataset.set_format(type="torch", columns=columns)
 
     def train_dataloader(self, shuffle=True):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=shuffle)
+        return DataLoader(
+            self.train_dataset, 
+            batch_size=self.batch_size, 
+            shuffle=shuffle,
+            num_workers=4,
+            pin_memory=True
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size)
+        return DataLoader(
+            self.val_dataset, 
+            batch_size=self.batch_size,
+            num_workers=4,
+            pin_memory=True
+        )
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size)
+        return DataLoader(
+            self.test_dataset, 
+            batch_size=self.batch_size,
+            num_workers=4,
+            pin_memory=True
+        )
     
     def predict_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size)
+        return DataLoader(
+            self.test_dataset, 
+            batch_size=self.batch_size,
+            num_workers=4,
+            pin_memory=True
+        )
