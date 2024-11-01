@@ -3,7 +3,7 @@ import lightning as pl
 from torch import nn
 from torchmetrics import MetricCollection
 from torchmetrics.regression import MeanAbsoluteError, SpearmanCorrCoef
-from transformers import EsmForSequenceClassification, AutoTokenizer
+from transformers import EsmForSequenceClassification, AutoTokenizer, EsmModel
 from peft import get_peft_model, LoraConfig, TaskType, set_peft_model_state_dict, get_peft_model_state_dict
 import wandb
 import os
@@ -15,7 +15,7 @@ from egfr_binder_rd2.utils import hash_seq
 from typing import List, Dict, Optional
 import numpy as np
 from dataclasses import dataclass
-
+from esm.modules import TransformerLayer
 # Utility functions
 def create_pairwise_comparisons(batch, outputs, label):
     device = outputs.device
@@ -27,8 +27,9 @@ def create_pairwise_comparisons(batch, outputs, label):
     pairs = torch.combinations(torch.arange(n_samples), r=2)
     labels = batch[label].to(device)
 
-    scores_i = outputs[pairs[:, 0]]
-    scores_j = outputs[pairs[:, 1]]
+    # Ensure outputs maintain gradients
+    scores_i = outputs[pairs[:, 0]].clone()
+    scores_j = outputs[pairs[:, 1]].clone()
 
     labels_i = labels[pairs[:, 0]]
     labels_j = labels[pairs[:, 1]]
@@ -314,3 +315,186 @@ class BTEnsemble:
             # Note: We'll need to recompute validation scores if needed
             ensemble.add_member(model, 0.0, i)  
         return ensemble
+
+class PartialEnsembleHead(nn.Module):
+    def __init__(
+        self, 
+        hidden_size,
+        dropout=0.1
+    ):
+        super().__init__()
+        
+        self.regression_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_size // 2),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize the weights using Kaiming initialization for ReLU networks"""
+        for module in self.regression_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(
+                    module.weight, 
+                    mode='fan_in', 
+                    nonlinearity='relu'
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+    
+    def forward(self, pooler_output):
+        return self.regression_head(pooler_output)
+
+class PartialEnsembleModule(pl.LightningModule):
+    def __init__(
+        self,
+        label: str,  # Changed from labels to label since all heads predict same target
+        num_heads: int = 5,  # Number of ensemble heads
+        model_name: str = "facebook/esm2_t33_650M_UR50D",
+        lr: float = 5e-4,
+        peft_r: int = 8,
+        peft_alpha: int = 16,
+        max_length: int = 512,
+        xvar: str = 'binder_sequence',
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        
+        
+        self.label = label
+        self.max_length = max_length
+        
+        # Initialize base components
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.esm_model = self._initialize_model(model_name, peft_r, peft_alpha)
+        
+        # Create multiple independent heads predicting the same target
+        config = self.esm_model.config
+        self.ensemble_heads = nn.ModuleList([
+            PartialEnsembleHead(
+                hidden_size=config.hidden_size,
+                dropout=dropout
+            ) for _ in range(num_heads)
+        ])
+        
+        # Initialize metrics
+        self.train_metrics = MetricCollection({
+            "train_mae": MeanAbsoluteError(),
+            "train_spearman": SpearmanCorrCoef(),
+        })
+        self.val_mae = MeanAbsoluteError()
+        self.val_spearman = SpearmanCorrCoef()
+
+        # Add Bradley-Terry loss
+        self.bt_loss = BradleyTerryLoss()
+
+    def _initialize_model(self, model_name, peft_r, peft_alpha):
+        base_model = EsmModel.from_pretrained(
+            model_name,
+        )
+        peft_config = LoraConfig(
+            r=peft_r, 
+            lora_alpha=peft_alpha, 
+            task_type=TaskType.FEATURE_EXTRACTION,
+            target_modules=["query", "key", "value", "dense_h_to_4h", "dense_4h_to_h"],
+        )
+        return get_peft_model(base_model, peft_config)
+
+    def forward(self, batch):
+        outputs = self.esm_model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            output_hidden_states=True
+        )
+        
+        # Get predictions from each head
+        head_predictions = torch.cat([
+            head(outputs.pooler_output) for head in self.ensemble_heads
+        ], dim=1)  # Shape: (batch_size, num_heads)
+        
+        # Calculate mean and std across heads
+        mean_pred = head_predictions.mean(dim=1, keepdim=True)
+        std_pred = head_predictions.std(dim=1, keepdim=True)
+        
+        batch["head_predictions"] = head_predictions
+        batch["predictions"] = mean_pred
+        batch["uncertainties"] = std_pred
+        return batch
+
+    def _compute_loss(self, head_predictions, targets):
+        # Ensure targets have the same shape as predictions
+        targets = targets.view(-1, 1)  # reshape to [batch_size, 1]
+        
+        # Compute BT loss for each head independently
+        losses = []
+        for i in range(head_predictions.shape[1]):  # For each head
+            head_pred = head_predictions[:, i].view(-1, 1)  # reshape to [batch_size, 1]
+            scores_i, scores_j, y_ij = create_pairwise_comparisons(
+                {"predictions": head_pred, self.label: targets},
+                head_pred,
+                self.label
+            )
+            if scores_i is not None:
+                head_loss = self.bt_loss(scores_i, scores_j, y_ij)
+                losses.append(head_loss)
+        
+        # Return mean loss across heads if we have any valid comparisons
+        if losses:
+            return torch.stack(losses).mean()
+        return torch.tensor(0.0, device=self.device, requires_grad=True)  # Add requires_grad=True
+
+    def training_step(self, batch, batch_idx):
+        batch = self(batch)
+        head_predictions = batch["head_predictions"]
+        mean_predictions = batch["predictions"]
+        
+        # Compute BT loss across all heads
+        loss = self._compute_loss(head_predictions, batch[self.label])
+        self.log("train_loss", loss)
+        
+        # Update metrics using mean prediction
+        self.train_metrics(mean_predictions.view(-1), batch[self.label])
+        self.log_dict(self.train_metrics)
+        
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        batch = self(batch)
+        mean_predictions = batch["predictions"]
+        uncertainties = batch["uncertainties"]
+        
+        # Log mean prediction metrics - ensure predictions maintain dimension
+        self.val_mae(mean_predictions.view(-1), batch[self.label])
+        self.val_spearman(mean_predictions.view(-1), batch[self.label])
+        
+        self.log("val_mae", self.val_mae, sync_dist=True)
+        self.log("val_spearman", self.val_spearman, sync_dist=True)
+        
+        # Log average uncertainty
+        self.log("val_uncertainty", uncertainties.mean(), sync_dist=True)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        outputs = self(batch)
+        return {
+            'predictions': outputs['predictions'].view(-1),  # Changed from squeeze()
+            'uncertainties': outputs['uncertainties'].view(-1),  # Changed from squeeze()
+            'head_predictions': outputs['head_predictions'],  # Remove squeeze()
+            'sequence': batch[self.hparams.xvar],
+            'target': batch[self.label],
+        }
