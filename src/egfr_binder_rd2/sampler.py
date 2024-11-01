@@ -459,17 +459,17 @@ class DirectedEvolution:
 def main():
     # Define multiple parent sequences
     parent_binder_seqs = [
-       'AERMRRRFESIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS'
+       'PSFSACPSNYDGVCCNGGVCHLAESLTSYTCQCILGYSGHRVQTFDLRYTELRRR'
     ] * 10
     
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
-        generations=40,
+        generations=80,
         n_to_fold=50,                # Total sequences to fold per generation
         num_parents=10,               # Number of parents to keep
         top_k=50,                    # Top sequences to consider
-        n_parallel_chains=16,        # Parallel chains per sequence
+        n_parallel_chains=32,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
         n_steps=200,                  # Steps per chain
         max_mutations=5,             # Max mutations per sequence
