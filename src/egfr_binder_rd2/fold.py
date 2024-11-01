@@ -116,7 +116,6 @@ class LocalColabFold:
         except subprocess.CalledProcessError as e:
             logger.error(f"Command failed with error: {e}")
             logger.error(f"Error output: {e.stderr}")
-            raise
         volume.commit()
         
     @staticmethod
