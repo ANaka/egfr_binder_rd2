@@ -28,6 +28,7 @@ from egfr_binder_rd2.datamodule import SequenceDataModule
 from egfr_binder_rd2.bt import BTRegressionModule
 from egfr_binder_rd2.esm_regression_expert import EsmRegressionExpert
 import logging
+from egfr_binder_rd2.utils import hash_seq
 
 
 # Set up logging
@@ -164,7 +165,7 @@ def train_bt_model(
     wandb_project: str,
     wandb_entity: str,
     model_name: str = "facebook/esm2_t6_8M_UR50D",
-    batch_size: int = 32,
+    batch_size: int = 48,
     max_epochs: int = 40,
     learning_rate: float = 1e-3,
     peft_r: int = 8,
@@ -173,6 +174,7 @@ def train_bt_model(
     transform_type: str = "rank",
     make_negative: bool = False,
     seed: int = 117,
+    xvar: str = 'binder_sequence',  # Add xvar parameter
 ):
     """Train a Bradley-Terry regression model on sequence data."""
     # Validate yvar is a supported type
@@ -227,7 +229,7 @@ def train_bt_model(
     )
     data_module.setup()
     
-    # Initialize model
+    # Initialize model with xvar
     model = BTRegressionModule(
         label=yvar,
         model_name=model_name,
@@ -235,6 +237,7 @@ def train_bt_model(
         peft_r=peft_r,
         peft_alpha=peft_alpha,
         max_length=max_length,
+        xvar=xvar,  # Pass xvar to model
     )
     
     # Set up W&B logger with existing run
@@ -264,6 +267,46 @@ def train_bt_model(
     # Train model
     logger.info("Starting training...")
     trainer.fit(model, data_module)
+    
+    # Get predictions with sequences
+    logger.info("Generating prediction tables...")
+    train_preds = trainer.predict(model, data_module.train_dataloader(shuffle=False))
+    val_preds = trainer.predict(model, data_module.val_dataloader())
+    test_preds = trainer.predict(model, data_module.test_dataloader())
+
+    # Convert predictions and sequences to lists
+    train_df = pd.DataFrame({
+        'predictions': torch.cat([x['predictions'] for x in train_preds]).cpu().numpy(),
+        'sequence': [seq for batch in train_preds for seq in batch['sequence']],
+    })
+    val_df = pd.DataFrame({
+        'predictions': torch.cat([x['predictions'] for x in val_preds]).cpu().numpy(),
+        'sequence': [seq for batch in val_preds for seq in batch['sequence']],
+    })
+    test_df = pd.DataFrame({
+        'predictions': torch.cat([x['predictions'] for x in test_preds]).cpu().numpy(),
+        'sequence': [seq for batch in test_preds for seq in batch['sequence']],
+    })
+
+    # Add sequence info and other metrics
+    train_df[yvar] = data_module.train_dataset[yvar].numpy()
+    val_df[yvar] = data_module.val_dataset[yvar].numpy()
+    test_df[yvar] = data_module.test_dataset[yvar].numpy()
+
+    # Add additional metrics
+    for df, split_name in [(train_df, 'train'), (val_df, 'val'), (test_df, 'test')]:
+        df['pred_rank'] = df['predictions'].rank()
+        df['true_rank'] = df[yvar].rank()
+        df['residuals'] = df[yvar] - df['predictions']
+        df['split'] = split_name
+        df['length'] = df['sequence'].str.len()
+        df['hash'] = df['sequence'].apply(hash_seq)
+
+    # Log prediction tables to wandb
+    for split_name, df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+        wandb_logger.experiment.log({
+            f"{split_name}_predictions": wandb.Table(dataframe=df)
+        })
     
     # Save adapter with timestamp
     output_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["bt_models"]
@@ -330,13 +373,15 @@ def sample_sequences(
     
     # Process each starting sequence
     for seq_idx, sequence in enumerate(sequences):
-        logger.info(f"Processing sequence {seq_idx + 1}/{len(sequences)}: {sequence}")
+        # Get hash of parent sequence
+        parent_hash = hash_seq(sequence)
+        
+        logger.info(f"Processing sequence {seq_idx + 1}/{len(sequences)}: {sequence} (hash: {parent_hash})")
         
         # Run serial chains for this sequence
         for serial_idx in range(n_serial_chains):
             logger.info(f"Running serial chain {serial_idx + 1}/{n_serial_chains} for sequence {seq_idx + 1}")
             
-            # Run directed evolution
             variants, scores = evo_prot_grad.DirectedEvolution(
                 wt_protein=sequence,
                 output="all",
@@ -356,16 +401,19 @@ def sample_sequences(
                         "run": timestamp,
                         "parent_idx": seq_idx,
                         "parent_seq": sequence,
+                        "parent_hash": parent_hash,
                         "chain": total_chains,
                         "step": step,
                         "score": score,
                         "sequence": seq,
+                        "sequence_hash": hash_seq(seq),
+                        "length": len(seq),
                     })
                 total_chains += 1
     
     # Convert to DataFrame, remove duplicates, and sort by score
     df = pd.DataFrame(results)
-    df = df.drop_duplicates(subset=['sequence'])
+    df = df.drop_duplicates(subset=['sequence_hash'])
     df = df.sort_values('score', ascending=False)
     
     logger.info(f"Generated {len(df)} unique sequences across {total_chains} chains")
@@ -403,10 +451,10 @@ def train():
     train_bt_model.remote(
         yvar="pae_interaction",
         wandb_project="egfr-binder-rd2", 
-        wandb_entity="anaka",
+        wandb_entity="anaka_personal",
         model_name="facebook/esm2_t6_8M_UR50D",
         batch_size=32,
-        max_epochs=40,
+        max_epochs=10,
         learning_rate=1e-3,
         peft_r=8,
         peft_alpha=16,
