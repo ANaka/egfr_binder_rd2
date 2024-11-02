@@ -16,6 +16,7 @@ OUTPUT_DIRS = {
     "msa_results": Path("msa_results/"),
     "lineage_csv": Path("lineage.csv"),
     "esm2_pll_results": Path("esm2_pll_results/"),
+    "esm2_pll_results_exact": Path("esm2_pll_results_exact/"),
     "bt_models": Path("bt_models/"),
     "rd1_fold_df": Path("rd1_fold_df.csv"),
     "evolution_trajectories": Path("evolution_trajectories/"),
