@@ -10,6 +10,7 @@ from modal import Image, App, method, enter, Dict, Volume, Mount, interact
 from egfr_binder_rd2 import (
     EGFS, 
     EGFR, 
+    OFFICIAL_EGFR,
     COLABFOLD_GPU_CONCURRENCY_LIMIT, 
     MODAL_VOLUME_NAME,
     MSA_QUERY_HOST_URL,
@@ -849,3 +850,72 @@ def benchmark_parallel_fold():
     logger.info(f"Parallel benchmark fold completed in {duration:.2f} seconds")
 
     return result
+
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def fold_high_quality(input_path: str, num_recycle: int=3, num_seeds: int=3, num_models: int=5, templates: bool=True) -> Path:
+    """Run high quality folding with more recycling, seeds, and models.
+    
+    Args:
+        input_path: Path to input MSA or sequence file
+        target_seq: Target sequence to pair with binder (defaults to official EGFR sequence)
+    """
+    # Ensure paths are within Modal volume
+    input_path = Path(MODAL_VOLUME_PATH) / input_path
+    output_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded_high_quality"]
+    
+    # Create output directory if it doesn't exist
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    
+    colabfold = LocalColabFold()
+    
+    logger.info(f"Starting high quality folding for {input_path}")
+    return colabfold.colabfold_batch.remote(
+        input_path, 
+        output_dir,
+        num_recycle=num_recycle,
+        num_seeds=num_seeds,
+        num_models=num_models,
+        templates=templates
+    )
+
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def fold_binder_high_quality(binder_seq: str, target_seq: str=OFFICIAL_EGFR) -> dict:
+    """Run complete high quality folding pipeline for a single binder sequence.
+    
+    Args:
+        binder_seq: Binder sequence to fold
+        target_seq: Target sequence (defaults to official EGFR sequence)
+    
+    Returns:
+        Dictionary containing folding metrics
+    """
+    logger.info(f"Starting high quality folding pipeline for binder sequence")
+    
+    # First ensure we have MSA
+    msa_paths = get_msa_for_binder.remote([binder_seq], target_seq)
+    if not msa_paths:
+        raise ValueError("MSA generation failed")
+    
+    # Run high quality folding
+    fold_high_quality.remote(msa_paths[0])
+    
+    # Extract metrics
+    seq_hash = hash_seq(f"{binder_seq}:{target_seq}")
+    metrics = get_metrics_from_hash(seq_hash)
+    
+    return metrics
+
+@app.local_entrypoint()
+def test_high_quality_fold():
+    """Test the high quality folding functionality."""
+    test_seq = EGFS  # Using the example binder sequence
+    result = fold_binder_high_quality.remote(test_seq)
+    print(f"High quality folding results: {result}")
