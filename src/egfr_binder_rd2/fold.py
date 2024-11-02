@@ -490,6 +490,8 @@ def calc_percentage_hydrophobic(sequence: str) -> float:
     hydrophobic = set('VILMFYW')
     return sum(1 for aa in sequence if aa in hydrophobic) / len(sequence)
 
+
+
 def get_metrics_from_hash(seq_hash: str) -> dict:
     """Extract metrics from folding results for a given sequence hash."""
     folded_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
@@ -555,13 +557,13 @@ def get_metrics_from_hash(seq_hash: str) -> dict:
                         pae_array[:binder_length, binder_length:].mean()
                     ) / 2)
             
-            # Add epitope interaction analysis
-            parser = PDB.PDBParser(QUIET=True)
-            structure = parser.get_structure("protein", pdb_path)
             
             # Add sequence property metrics for the binder
             binder_charged_fraction = calc_percentage_charged(binder_seq)
             binder_hydrophobic_fraction = calc_percentage_hydrophobic(binder_seq)
+            
+            # Calculate sequence indices for binder
+            sequence_indices = calculate_sequence_indices(binder_seq)
             
             results.append({
                 'seq_hash': seq_hash,
@@ -579,7 +581,10 @@ def get_metrics_from_hash(seq_hash: str) -> dict:
                 'binder_hydrophobic_fraction': binder_hydrophobic_fraction,
                 'parent_hash': parent_info.get('parent_hash', None),
                 'parent_sequence': parent_info.get('parent_sequence', None),
-                'mutations': parent_info.get('mutations', None)
+                'mutations': parent_info.get('mutations', None),
+                'binder_hydrophobicity': sequence_indices['avg_hydrophobicity'],
+                'binder_hydropathy': sequence_indices['avg_hydropathy'],
+                'binder_solubility': sequence_indices['avg_solubility'],
             })
     
     return results
@@ -589,120 +594,56 @@ def get_metrics_from_hash(seq_hash: str) -> dict:
     timeout=9600,
     volumes={MODAL_VOLUME_PATH: volume},
 )
-def update_metrics_for_all_folded():
-    """Update metrics CSV with results from all folded structures, only processing new hashes."""
+def update_metrics_for_all_folded(overwrite: bool = False):
+    """Update metrics CSV with results from all folded structures.
+    
+    Args:
+        overwrite: If True, recalculate all metrics. If False, only calculate for missing entries
+    """
+    metrics_csv_path = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["metrics_csv"]
     folded_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded"]
-    metrics_file = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["metrics_csv"]
     
-    # Create metrics directory if it doesn't exist
-    metrics_file.parent.mkdir(parents=True, exist_ok=True)
+    # Read existing metrics if file exists and not overwriting
+    existing_metrics = {}
+    if metrics_csv_path.exists() and not overwrite:
+        df = pd.read_csv(metrics_csv_path)
+        existing_metrics = {row['hash']: row for _, row in df.iterrows()}
     
-    # Load existing metrics if available
-    existing_df = pd.DataFrame()
-    existing_hashes = set()
-    if metrics_file.exists():
-        existing_df = pd.read_csv(metrics_file)
-        existing_hashes = set(existing_df['seq_hash'].unique())
-        logger.info(f"Found existing metrics for {len(existing_hashes)} sequence hashes")
+    # Collect all metrics
+    all_metrics = []
+    pdb_files = list(folded_dir.glob("*.pdb"))
     
-    # Get all unique sequence hashes from folded files
-    all_files = list(folded_dir.glob("*_scores*.json"))
-    all_hashes = set(f.name.split('_')[0] for f in all_files)
-    
-    # Identify new hashes that need processing
-    new_hashes = all_hashes - existing_hashes
-    logger.info(f"Found {len(new_hashes)} new sequence hashes to process")
-    
-    if not new_hashes:
-        logger.info("No new sequences to process")
-        return existing_df  # Return existing DataFrame instead of file path
-    
-    # Process new hashes
-    new_results = []
-    for seq_hash in new_hashes:
-        results = get_metrics_from_hash(seq_hash)
-        if results:
-            new_results.extend(results)
-    
-    if new_results:
-        # Convert new results to DataFrame
-        new_df = pd.DataFrame(new_results)
+    for i, pdb_path in enumerate(pdb_files):
+        seq_hash = pdb_path.stem.split('_')[0]  # Extract hash from filename
         
-        # Combine with existing results
-        if not existing_df.empty:
-            df = pd.concat([existing_df, new_df], ignore_index=True)
-        else:
-            df = new_df
-        
-        # Save updated metrics
-        df.to_csv(metrics_file, index=False)
-        logger.info(f"Added metrics for {len(new_results)} new models, total {len(df)} entries")
+        # Skip if already processed and not overwriting
+        if seq_hash in existing_metrics and not overwrite:
+            all_metrics.append(existing_metrics[seq_hash])
+            continue
+            
+        try:
+            metrics = get_metrics_from_hash(seq_hash)
+            if metrics:  # Only add if we got valid metrics
+                all_metrics.extend(metrics)
+        except Exception as e:
+            logger.error(f"Error processing {pdb_path}: {e}")
+            
+        # Log progress every 10 files
+        if (i + 1) % 10 == 0:
+            logger.info(f"Processed {i + 1}/{len(pdb_files)} PDB files")
+    
+    # Convert to DataFrame and save
+    if all_metrics:
+        df = pd.DataFrame(all_metrics)
+        df.to_csv(metrics_csv_path, index=False)
+        logger.info(f"Updated metrics saved to {metrics_csv_path}")
     else:
-        logger.info("No new valid results to add")
-        df = existing_df  # Use existing DataFrame if no new results
-    
+        logger.warning("No metrics were collected")
     return df
 
-
-# @app.function(
-#     image=image,
-#     timeout=9600,
-#     volumes={MODAL_VOLUME_PATH: volume},
-# )
-# def rebuild_substituted_a3ms() -> List[Path]:
-#     """Rebuild a3m files that were created by substitution, using the same parent templates
-#     but redoing the substitution process.
-    
-#     Returns:
-#         List[Path]: Paths to rebuilt a3m files
-#     """
-#     msa_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
-#     rebuilt_paths = []
-    
-#     # Find all lineage files
-#     lineage_files = list(msa_dir.glob("*.lineage.json"))
-#     logger.info(f"Found {len(lineage_files)} sequences with lineage information")
-    
-#     for lineage_file in lineage_files:
-#         try:
-#             with open(lineage_file, 'r') as f:
-#                 lineage_data = json.load(f)
-                
-#             binder_seq = lineage_data.get('binder_seq')
-#             parent_seq = lineage_data.get('parent_seq')
-            
-#             if not (binder_seq and parent_seq):
-#                 logger.warning(f"Missing sequence information in {lineage_file}")
-#                 continue
-            
-#             # Get paths
-#             parent_hash = hash_seq(f"{parent_seq}:{EGFR}")
-#             template_a3m_path = msa_dir / f"{parent_hash}.a3m"
-#             output_a3m_path = msa_dir / f"{lineage_file.stem.replace('.lineage', '')}.a3m"
-            
-#             if not template_a3m_path.exists():
-#                 logger.warning(f"Parent template not found: {template_a3m_path}")
-#                 continue
-                
-#             # Redo the substitution
-#             logger.info(f"Rebuilding {output_a3m_path}")
-#             rebuilt_path = swap_binder_seq_into_a3m(
-#                 binder_seq=binder_seq,
-#                 template_a3m_path=template_a3m_path,
-#                 output_path=output_a3m_path
-#             )
-#             rebuilt_paths.append(rebuilt_path)
-            
-#         except Exception as e:
-#             logger.error(f"Failed to process {lineage_file}: {str(e)}")
-#             continue
-    
-#     logger.info(f"Successfully rebuilt {len(rebuilt_paths)} a3m files")
-#     return rebuilt_paths
-
-# @app.local_entrypoint()
-# def do_rebuild():
-#     rebuild_substituted_a3ms.remote()
+@app.local_entrypoint()
+def update_metrics():
+    update_metrics_for_all_folded.remote(overwrite=True)
 
 @app.local_entrypoint()
 def benchmark_fold():
@@ -919,3 +860,69 @@ def test_high_quality_fold():
     test_seq = EGFS  # Using the example binder sequence
     result = fold_binder_high_quality.remote(test_seq)
     print(f"High quality folding results: {result}")
+
+# Add these constants near the top of the file with other constants
+HYDROPHOBICITY_INDICES = {
+    'A': {'hydrophobicity': 0.230188679, 'hydropathy': 0.700000000, 'solubility': 0.325669858},
+    'R': {'hydrophobicity': 0.226415094, 'hydropathy': 0.000000000, 'solubility': 0.463603847},
+    'N': {'hydrophobicity': 0.022641509, 'hydropathy': 0.111111111, 'solubility': 0.274060271},
+    'D': {'hydrophobicity': 0.173584906, 'hydropathy': 0.111111111, 'solubility': 0.170907494},
+    'C': {'hydrophobicity': 0.403773585, 'hydropathy': 0.777777778, 'solubility': 1.000000000},
+    'Q': {'hydrophobicity': 0.000000000, 'hydropathy': 0.111111111, 'solubility': 0.424648204},
+    'E': {'hydrophobicity': 0.177358491, 'hydropathy': 0.111111111, 'solubility': 0.000000000},
+    'G': {'hydrophobicity': 0.026415094, 'hydropathy': 0.455555556, 'solubility': 0.402625886},
+    'H': {'hydrophobicity': 0.230188679, 'hydropathy': 0.144444444, 'solubility': 0.198993339},
+    'I': {'hydrophobicity': 0.837735849, 'hydropathy': 1.000000000, 'solubility': 0.662440832},
+    'L': {'hydrophobicity': 0.577358491, 'hydropathy': 0.922222222, 'solubility': 0.711681552},
+    'K': {'hydrophobicity': 0.433962264, 'hydropathy': 0.066666667, 'solubility': 0.130628199},
+    'M': {'hydrophobicity': 0.445283019, 'hydropathy': 0.711111111, 'solubility': 0.766855148},
+    'F': {'hydrophobicity': 0.762264151, 'hydropathy': 0.811111111, 'solubility': 0.862558633},
+    'P': {'hydrophobicity': 0.735849057, 'hydropathy': 0.322222222, 'solubility': 0.351616012},
+    'S': {'hydrophobicity': 0.018867925, 'hydropathy': 0.411111111, 'solubility': 0.521767440},
+    'T': {'hydrophobicity': 0.018867925, 'hydropathy': 0.422222222, 'solubility': 0.381261111},
+    'W': {'hydrophobicity': 1.000000000, 'hydropathy': 0.400000000, 'solubility': 0.750136006},
+    'Y': {'hydrophobicity': 0.709433962, 'hydropathy': 0.355555556, 'solubility': 0.806226306},
+    'V': {'hydrophobicity': 0.498113208, 'hydropathy': 0.966666667, 'solubility': 0.539559639}
+}
+
+def calculate_sequence_indices(sequence: str) -> dict:
+    """Calculate various hydrophobicity indices for a sequence.
+    
+    Args:
+        sequence: Amino acid sequence
+        
+    Returns:
+        Dictionary containing average indices for the sequence
+    """
+    if not sequence:
+        return {
+            'avg_hydrophobicity': 0.0,
+            'avg_hydropathy': 0.0,
+            'avg_solubility': 0.0
+        }
+    
+    total_hydrophobicity = 0.0
+    total_hydropathy = 0.0
+    total_solubility = 0.0
+    valid_residues = 0
+    
+    for aa in sequence:
+        if aa in HYDROPHOBICITY_INDICES:
+            indices = HYDROPHOBICITY_INDICES[aa]
+            total_hydrophobicity += indices['hydrophobicity']
+            total_hydropathy += indices['hydropathy']
+            total_solubility += indices['solubility']
+            valid_residues += 1
+    
+    if valid_residues == 0:
+        return {
+            'avg_hydrophobicity': 0.0,
+            'avg_hydropathy': 0.0,
+            'avg_solubility': 0.0
+        }
+    
+    return {
+        'avg_hydrophobicity': total_hydrophobicity / valid_residues,
+        'avg_hydropathy': total_hydropathy / valid_residues,
+        'avg_solubility': total_solubility / valid_residues
+    }
