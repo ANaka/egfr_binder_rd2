@@ -517,9 +517,9 @@ class PartialEnsembleModule(pl.LightningModule):
 
         torch.save(save_dict, save_path)
         print(f"Model saved to: {save_path}")
-        print(f"Adapter state dict keys: {list(adapter_state_dict.keys())}")
-        print(f"Ensemble state dict keys: {list(ensemble_state_dict.keys())}")
-        print(f"Pooler state dict keys: {list(pooler_state_dict.keys())}")
+        # print(f"Adapter state dict keys: {list(adapter_state_dict.keys())}")
+        # print(f"Ensemble state dict keys: {list(ensemble_state_dict.keys())}")
+        # print(f"Pooler state dict keys: {list(pooler_state_dict.keys())}")
 
     @classmethod
     def load_model(cls, load_path: str):

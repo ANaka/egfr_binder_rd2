@@ -82,8 +82,9 @@ class DirectedEvolution:
         self.get_msa = modal.Function.lookup("simplefold", "get_msa_for_binder")
         
         logger.info("Initialized DirectedEvolution workflow.")
-        return self
 
+        # Add a class variable to store all tested sequences
+        self.all_tested_sequences_df = pd.DataFrame()
 
     @staticmethod
     def should_retrain(generation: int, retrain_frequency: int = 5) -> bool:
@@ -206,11 +207,10 @@ class DirectedEvolution:
             
             # Check if retraining is needed
             if self.should_retrain(gen, retrain_frequency):
-                logger.info(f"Generation {gen}: Retraining experts asynchronously...")
-                
-                # Train all experts in parallel
-                model_paths = self.train_experts.remote()
-                logger.info(f"Expert retraining completed: {model_paths}")
+                logger.info(f"Generation {gen}: Starting expert retraining in background...")
+                # Fire and forget - don't store or wait for the future
+                _ = self.train_experts.remote.aio()
+                logger.info("Expert retraining started asynchronously")
             
             # Calculate sequences to sample per parent
             seqs_per_parent = max(1, n_to_fold // len(current_parent_seqs))
@@ -523,14 +523,14 @@ class DirectedEvolution:
                 # Calculate average metrics
                 try:
                     pred_metrics = {
-                        'pae_interaction': predictions_df['pae_interaction_mean'].mean(),
-                        'i_ptm': predictions_df['i_ptm_mean'].mean(),
+                        'pae_interaction': predictions_df['pae_interaction_mean'].mean(),  # Predicted uses _mean
+                        'i_ptm': predictions_df['i_ptm_mean'].mean(),  # Predicted uses _mean
                         'pll': predictions_df['sequence_log_pll'].mean(),
                     }
                     
                     actual_metrics = {
-                        'pae_interaction': actuals_df['pae_interaction_mean'].mean(),
-                        'i_ptm': actuals_df['i_ptm_mean'].mean(),
+                        'pae_interaction': actuals_df['pae_interaction'].mean(),  # Actual doesn't use _mean
+                        'i_ptm': actuals_df['i_ptm'].mean(),  # Actual doesn't use _mean
                         'pll': actuals_df['sequence_log_pll'].mean(),
                     }
                     
@@ -543,17 +543,23 @@ class DirectedEvolution:
 
                 # Calculate correlations
                 try:
+                    # Rename columns during merge to avoid confusion
+                    predictions_df = predictions_df.rename(columns={
+                        'pae_interaction_mean': 'pae_interaction_pred',
+                        'i_ptm_mean': 'i_ptm_pred',
+                        'sequence_log_pll': 'sequence_log_pll_pred'
+                    })
+                    
                     merged_df = predictions_df.merge(
                         actuals_df,
                         left_on='sequence',
-                        right_on='binder_sequence',
-                        suffixes=('', '_actual')
+                        right_on='binder_sequence'
                     )
                     
                     if len(merged_df) > 1:  # Need at least 2 points for correlation
-                        pae_corr = np.corrcoef(merged_df['pae_interaction_mean'], merged_df['pae_interaction_mean_actual'])[0,1]
-                        ptm_corr = np.corrcoef(merged_df['i_ptm_mean'], merged_df['i_ptm_mean_actual'])[0,1]
-                        pll_corr = np.corrcoef(merged_df['sequence_log_pll'], merged_df['sequence_log_pll_actual'])[0,1]
+                        pae_corr = np.corrcoef(merged_df['pae_interaction_pred'], merged_df['pae_interaction'])[0,1]
+                        ptm_corr = np.corrcoef(merged_df['i_ptm_pred'], merged_df['i_ptm'])[0,1]
+                        pll_corr = np.corrcoef(merged_df['sequence_log_pll_pred'], merged_df['sequence_log_pll'])[0,1]
                         
                         logger.info("\nCorrelations between predicted and actual values:")
                         logger.info(f"iPAE correlation: {pae_corr:.3f}")
@@ -565,6 +571,121 @@ class DirectedEvolution:
                     logger.error(f"Error calculating correlations: {str(e)}")
             else:
                 logger.warning("Not enough data to compare predicted vs actual metrics")
+
+            # After getting metrics, append new sequences with actual results to our accumulated dataframe
+            generation_df = actuals_df.copy()  # Only use actuals_df instead of combined_df
+            generation_df['generation'] = gen
+            self.all_tested_sequences_df = pd.concat([self.all_tested_sequences_df, generation_df], ignore_index=True)
+            
+            # Remove duplicates, keeping the most recent evaluation
+            self.all_tested_sequences_df = (self.all_tested_sequences_df
+                .sort_values('generation', ascending=False)
+                .drop_duplicates(subset='binder_sequence', keep='first')
+                .reset_index(drop=True))
+
+            # Use all_tested_sequences_df for ranking
+            logger.info("Calculating fitness using all historically tested sequences")
+            ranking_df = self.all_tested_sequences_df.copy()
+            logger.info(f"Using {len(ranking_df)} historically tested sequences for ranking")
+
+            if len(ranking_df) == 0:
+                logger.warning("No sequences found for ranking. Using parent sequences for next generation.")
+                current_parent_seqs = current_parent_seqs
+                continue
+
+            # Calculate ranks and fitness using all historical data
+            ranking_df.loc[:, 'pae_interaction_rank'] = 1 - ranking_df['pae_interaction'].rank(pct=True)
+            ranking_df.loc[:, 'i_ptm_rank'] = ranking_df['i_ptm'].rank(pct=True)
+            ranking_df.loc[:, 'sequence_log_pll_rank'] = ranking_df['sequence_log_pll'].rank(pct=True)
+            ranking_df.loc[:, 'fitness'] = (
+                ranking_df['pae_interaction_rank'] + 
+                ranking_df['i_ptm_rank'] + 
+                ranking_df['sequence_log_pll_rank']
+            ) / 3
+
+            # Sort by fitness
+            ranking_df = ranking_df.sort_values('fitness', ascending=False).reset_index(drop=True)
+            logger.info(f"Successfully ranked {len(ranking_df)} sequences")
+
+            # Log statistics for this generation
+            logger.info("\nGeneration Statistics:")
+            logger.info(f"Mean PLL: {combined_df['sequence_log_pll'].mean():.2f}")
+            logger.info(f"Mean iPAE: {combined_df['pae_interaction'].mean():.2f}")
+            logger.info(f"Mean i_ptm: {combined_df['i_ptm'].mean():.2f}")
+            logger.info(f"Best PLL: {combined_df['sequence_log_pll'].max():.2f}")
+            logger.info(f"Best iPAE: {combined_df['pae_interaction'].min():.2f}")
+            logger.info(f"Best i_ptm: {combined_df['i_ptm'].max():.2f}")
+            
+            # Select top sequences
+            logger.info(f"\nSelecting top {top_k} sequences based on fitness scores...")
+            if select_from_current_gen_only:
+                logger.info("Selecting from current generation only")
+            else:
+                logger.info("Selecting from all historical sequences")
+            top_sequences = ranking_df.head(top_k)
+            
+            # Log the top sequences with detailed metrics
+            # logger.info("\nTop sequences selected for generation:")
+            # for idx, row in top_sequences.iterrows():
+            #     logger.info(
+            #         f"Sequence={row['binder_sequence']} "
+            #         f"Sequence {idx + 1:03d}: "
+            #         f"Length={len(row['binder_sequence'])}, "
+            #         f"Fitness={row['fitness']:.3f} "
+            #         f"(PLL_rank={row['sequence_log_pll_rank']:.3f}, "
+            #         f"iPAE_rank={row['pae_interaction_rank']:.3f}, "
+            #         f"iPTM_rank={row['i_ptm_rank']:.3f}), "
+            #         f"Raw: PLL={row['sequence_log_pll']:.2f}, "
+            #         f"iPAE={row['pae_interaction']:.2f}, "
+            #         f"iPTM={row['i_ptm']:.2f}, "
+                    
+            #     )
+            
+            current_parent_seqs = self.select_multiple_parents_probabilistically(
+                top_sequences,
+                num_parents=num_parents,
+                temperature=parent_selection_temperature
+            )
+            
+            # Log selected parents
+            logger.info(f"\nSelected {len(current_parent_seqs)} parents for next generation:")
+            for idx, parent in enumerate(current_parent_seqs, 1):
+                parent_metrics = top_sequences[top_sequences['binder_sequence'] == parent].iloc[0]
+                logger.info(
+                    f"Sequence={parent} "
+                    f"Parent {idx:03d}: "
+                    f"Length={len(parent)}, "
+                    f"PLL={parent_metrics['sequence_log_pll']:.2f} (rank={parent_metrics['sequence_log_pll_rank']:.2f}), "
+                    f"PAE={parent_metrics['pae_interaction']:.2f} (rank={parent_metrics['pae_interaction_rank']:.2f}), "
+                    f"iPTM={parent_metrics['i_ptm']:.2f} (rank={parent_metrics['i_ptm_rank']:.2f}), "
+                    f"Fitness={parent_metrics['fitness']:.2f}, "
+                    
+                )
+            
+            # Store top sequences for final return
+            all_final_sequences.extend(top_sequences['binder_sequence'].tolist())
+            
+            # Log generation metrics with more detail
+            gen_metrics = {
+                "mean_pll": float(combined_df['sequence_log_pll'].mean()),
+                "mean_ipae": float(combined_df['pae_interaction'].mean()),
+                "mean_iptm": float(combined_df['i_ptm'].mean()),
+                "best_pll": float(combined_df['sequence_log_pll'].max()),
+                "best_ipae": float(combined_df['pae_interaction'].min()),
+                "best_iptm": float(combined_df['i_ptm'].max()),
+                "parent_sequences": current_parent_seqs,
+                "top_sequences": [{
+                    "sequence": row['binder_sequence'],
+                    "fitness": float(row['fitness']),
+                    "pll": float(row['sequence_log_pll']),
+                    "pll_rank": float(row['sequence_log_pll_rank']),
+                    "ipae": float(row['pae_interaction']),
+                    "ipae_rank": float(row['pae_interaction_rank']),
+                    "iptm": float(row['i_ptm']),
+                    "iptm_rank": float(row['i_ptm_rank'])
+                } for _, row in top_sequences.iterrows()]
+            }
+            metadata.add_generation(gen, gen_metrics)
 
         logger.info("Directed evolution cycle completed.")
         # Save metadata
@@ -724,24 +845,43 @@ def main():
         # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRRR',
         # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRRRR',
     ]
+    parent_binder_seqs = [
+        'SYDGYCLNKGVCHHIESLDSYTCQCVIGYSGDRCQTRDLRFLELQ'
+    ]
+    parent_binder_seqs = [
+        'AERMRRRFESIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
+         
+    ]
+    parent_binder_seqs = [
+        'SLFSRCPRRYHGICGNNGLCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLRN',
+        'GLFSICPRRYQGICKNNGTCRYALNLRTYTCQCVSGYTGARCQELDIRYLLLRY',
+        'SLFSACPSRYHGICKNNGVCRYAISLRSSTCHCVSGYTGYRCQELDIIHLLLRY',
+        'SLFSICPRRYHGICGNNGLCRYAINLRTYTCRCVSGYTGIRCQELDIRYLLLRS',
+        'SLFSACPSRYHGICKNNGQCRYAISLRSSTCHCVSGYTGYRCQELDIIHLLLRY',
+        'SLFSICPRRYRGICKNNGSCRYALNLRTYTCQCVSGYTGARCQELDIRYLLLRS',
+        'SLFSACPSKFHGICNNNGVCRYAINLRSYTCICLEGYTGDRCQELDIRYLLLRL',
+        'SLFSACPSKFHGICNNNGVCRYAINLRSYTCICLEGYTGDRCQELDIRHLLLRL',
+        'SLFSACPSKFHGICNNNGVCRYAISLRSYTCICLEGYTGPRCQELDIRHLLLRL',
+        'SLFSACPSRYHGICKNNGVCRYAINLRSYTCHCVSGYTGDRCQELDIRFLLLRY'
+    ]
     
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
         generations=80,
-        n_to_fold=10,                # Total sequences to fold per generation
-        num_parents=1,               # Number of parents to keep
+        n_to_fold=50,                # Total sequences to fold per generation
+        num_parents=10,               # Number of parents to keep
         top_k=200,                    # Top sequences to consider
         n_parallel_chains=16,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
         n_steps=50,                  # Steps per chain
         max_mutations=5,             # Max mutations per sequence
-        evoprotgrad_top_fraction=0.4,
+        evoprotgrad_top_fraction=0.25,
         parent_selection_temperature=0.5,
         temp_cycle_period=5,  # Complete cycle every 5 generations
         min_sampling_temp=0.3,  # Minimum temperature value
         max_sampling_temp=2.0,  # Maximum temperature value
-        retrain_frequency=3,
+        retrain_frequency=2,
         seed=42,
         select_from_current_gen_only=True,  # Add this parameter
     )

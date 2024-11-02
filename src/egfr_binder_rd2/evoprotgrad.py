@@ -19,6 +19,8 @@ import time
 from functools import wraps
 import random
 import asyncio
+import torch.backends.cuda as cuda
+import torch.backends.cudnn as cudnn
 
 import evo_prot_grad
 
@@ -226,6 +228,13 @@ def train_bt_model(
     # Set random seeds
     torch.manual_seed(seed)
     
+    # Optimize CUDA settings
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on matmul
+        torch.backends.cudnn.allow_tf32 = True        # Allow TF32 on cudnn
+        torch.backends.cudnn.benchmark = True         # Enable cudnn auto-tuner
+        torch.backends.cudnn.enabled = True           # Enable cudnn
+
     # Set matmul precision
     torch.set_float32_matmul_precision('high')
     
@@ -458,16 +467,7 @@ async def train_experts_async():
         make_negative=False,
     )
     
-    # Wait for all models to complete training
-    pae_model_path, iptm_model_path, plddt_model_path = await asyncio.gather(
-        pae_task, iptm_task, plddt_task
-    )
     
-    return {
-        "pae": pae_model_path,
-        "iptm": iptm_model_path,
-        "plddt": plddt_model_path
-    }
 
 @app.function(
     image=image,
@@ -500,6 +500,14 @@ def sample_sequences(
     """
     # Set random seeds
     torch.manual_seed(seed)
+    
+    # Optimize CUDA settings
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on matmul
+        torch.backends.cudnn.allow_tf32 = True        # Allow TF32 on cudnn
+        torch.backends.cudnn.benchmark = True         # Enable cudnn auto-tuner
+        torch.backends.cudnn.enabled = True           # Enable cudnn
+
     torch.set_float32_matmul_precision('high')
     
     # Initialize experts
@@ -720,8 +728,6 @@ def train():
 
 
 @app.local_entrypoint()
-def test_training():
+def train_async():
     """Test just the training functionality."""
-    print("Starting expert training test...")
-    model_paths = train_experts_async.remote()
-    print(f"Training completed. Model paths: {model_paths}")
+    train_experts_async.remote()
