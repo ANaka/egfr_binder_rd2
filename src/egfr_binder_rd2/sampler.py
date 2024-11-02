@@ -47,7 +47,7 @@ class DirectedEvolution:
     def setup(self):
         # Look up remote functions
         self.sample_sequences = modal.Function.lookup("bt-training", "sample_sequences")
-        self.train_bt_model = modal.Function.lookup("bt-training", "train_bt_model")
+        self.train_experts = modal.Function.lookup("bt-training", "train_experts_async")
         self.process_sequences = modal.Function.lookup("esm2-inference", "process_sequences")
         self.update_pll_metrics = modal.Function.lookup("esm2-inference", "update_pll_metrics")
         self.fold_binder = modal.Function.lookup("simplefold", "fold_binder")
@@ -180,30 +180,11 @@ class DirectedEvolution:
             
             # Check if retraining is needed
             if self.should_retrain(gen, retrain_frequency):
-                logger.info(f"Generation {gen}: Retraining experts...")
+                logger.info(f"Generation {gen}: Retraining experts asynchronously...")
                 
-                # Train PAE interaction expert
-                pae_model_path = self.train_bt_model.remote(
-                    yvar="pae_interaction",
-                    wandb_project="egfr-binder-rd2",
-                    wandb_entity="anaka_personal",
-                    transform_type="standardize",
-                    make_negative=True,
-                )
-                logger.info(f"Trained PAE interaction expert: {pae_model_path}")
-
-                # Train iPTM expert
-                iptm_model_path = self.train_bt_model.remote(
-                    yvar="i_ptm",
-                    wandb_project="egfr-binder-rd2",
-                    wandb_entity="anaka_personal",
-                    transform_type="standardize",
-                    make_negative=False,
-                )
-                logger.info(f"Trained iPTM expert: {iptm_model_path}")
-                # Return updated expert configs
-                logger.info("Expert retraining completed.")
-                
+                # Train all experts in parallel
+                model_paths = self.train_experts.remote()
+                logger.info(f"Expert retraining completed: {model_paths}")
             
             # Calculate sequences to sample per parent
             seqs_per_parent = max(1, n_to_fold // len(current_parent_seqs))
@@ -604,17 +585,17 @@ def main():
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
         generations=80,
-        n_to_fold=20,                # Total sequences to fold per generation
+        n_to_fold=30,                # Total sequences to fold per generation
         num_parents=10,               # Number of parents to keep
-        top_k=100,                    # Top sequences to consider
+        top_k=200,                    # Top sequences to consider
         n_parallel_chains=16,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
         n_steps=100,                  # Steps per chain
         max_mutations=5,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.25,
-        parent_selection_temperature=0.5,
+        parent_selection_temperature=1,
         temp_cycle_period=5,  # Complete cycle every 5 generations
-        min_sampling_temp=0.,  # Minimum temperature value
+        min_sampling_temp=0.3,  # Minimum temperature value
         max_sampling_temp=2.0,  # Maximum temperature value
         retrain_frequency=3,
         seed=42,

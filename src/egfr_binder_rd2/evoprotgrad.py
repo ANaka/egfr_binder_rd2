@@ -18,6 +18,7 @@ from sklearn.model_selection import KFold
 import time
 from functools import wraps
 import random
+import asyncio
 
 import evo_prot_grad
 
@@ -430,6 +431,51 @@ def train_bt_model(
     volumes={MODAL_VOLUME_PATH: volume},
     secrets=[wandb_secret],
 )
+async def train_experts_async():
+    """Train all experts in parallel."""
+    # Train models concurrently
+    pae_task = train_bt_model.remote.aio(
+        yvar="pae_interaction",
+        wandb_project="egfr-binder-rd2",
+        wandb_entity="anaka_personal",
+        transform_type="standardize",
+        make_negative=True,
+    )
+    
+    iptm_task = train_bt_model.remote.aio(
+        yvar="i_ptm",
+        wandb_project="egfr-binder-rd2",
+        wandb_entity="anaka_personal",
+        transform_type="standardize",
+        make_negative=False,
+    )
+    
+    plddt_task = train_bt_model.remote.aio(
+        yvar="binder_plddt",
+        wandb_project="egfr-binder-rd2",
+        wandb_entity="anaka_personal",
+        transform_type="standardize",
+        make_negative=False,
+    )
+    
+    # Wait for all models to complete training
+    pae_model_path, iptm_model_path, plddt_model_path = await asyncio.gather(
+        pae_task, iptm_task, plddt_task
+    )
+    
+    return {
+        "pae": pae_model_path,
+        "iptm": iptm_model_path,
+        "plddt": plddt_model_path
+    }
+
+@app.function(
+    image=image,
+    gpu="A100",
+    timeout=3600,
+    volumes={MODAL_VOLUME_PATH: volume},
+    secrets=[wandb_secret],
+)
 def sample_sequences(
     sequences: List[str],
     expert_configs: Optional[List[ExpertConfig]] = None,
@@ -673,3 +719,9 @@ def train():
     )
 
 
+@app.local_entrypoint()
+def test_training():
+    """Test just the training functionality."""
+    print("Starting expert training test...")
+    model_paths = train_experts_async.remote()
+    print(f"Training completed. Model paths: {model_paths}")
