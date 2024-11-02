@@ -19,6 +19,7 @@ OUTPUT_DIRS = {
     "bt_models": Path("bt_models/"),
     "rd1_fold_df": Path("rd1_fold_df.csv"),
     "evolution_trajectories": Path("evolution_trajectories/"),
+    "inference_results": Path("inference_results/"),
 }
 
 LOGGING_CONFIG = {
@@ -56,6 +57,7 @@ class ExpertType(enum.Enum):
     ESM = "esm"
     iPAE = "pae_interaction"
     iPTM = "i_ptm"
+    pLDDT = "binder_plddt"
     
     @classmethod
     def from_str(cls, label: str) -> 'ExpertType':
@@ -64,11 +66,17 @@ class ExpertType(enum.Enum):
 @dataclass
 class ExpertConfig:
     type: ExpertType
-    weight: float = 1.0
     temperature: float = 1.0
     make_negative: bool = False
-    transform_type: str = "rank"
+    transform_type: str = "standardize"
     model_name: str = "facebook/esm2_t6_8M_UR50D"
+
+# Add new config class for ensemble models
+@dataclass
+class PartialEnsembleExpertConfig(ExpertConfig):
+    num_heads: int = 10
+    dropout: float = 0.1
+    explore_weight: float = 0.2
 
 @dataclass
 class EvolutionMetadata:
