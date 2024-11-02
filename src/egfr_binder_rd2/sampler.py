@@ -5,10 +5,13 @@ import pandas as pd
 import torch
 from datetime import datetime
 import numpy as np
+import json
+from pathlib import Path
 
 from egfr_binder_rd2.bt import BTEnsemble
-from egfr_binder_rd2 import LOGGING_CONFIG, MODAL_VOLUME_PATH, OUTPUT_DIRS, ExpertType, ExpertConfig, EvolutionMetadata
-
+from egfr_binder_rd2 import LOGGING_CONFIG, MODAL_VOLUME_PATH, OUTPUT_DIRS, ExpertType, ExpertConfig, EvolutionMetadata, PartialEnsembleExpertConfig
+from egfr_binder_rd2.fold import get_a3m_path
+from egfr_binder_rd2.utils import hash_seq
 # Set up logging
 logging.basicConfig(level=LOGGING_CONFIG["level"], format=LOGGING_CONFIG["format"])
 logger = logging.getLogger(__name__)
@@ -50,44 +53,34 @@ class DirectedEvolution:
         self.fold_binder = modal.Function.lookup("simplefold", "fold_binder")
         self.parallel_fold_binder = modal.Function.lookup("simplefold", "parallel_fold_binder")
         self.update_metrics = modal.Function.lookup("simplefold", "update_metrics_for_all_folded")
+        self.get_msa = modal.Function.lookup("simplefold", "get_msa_for_binder")
         
         logger.info("Initialized DirectedEvolution workflow.")
         return self
 
-    @modal.method()
-    def retrain_experts(self):
-        """Retrain the Bradley-Terry experts using accumulated data."""
-        logger.info("Retraining experts...")
-        
-        # Train PAE interaction expert
-        pae_model_path = self.train_bt_model.remote(
-            yvar="pae_interaction",
-            wandb_project="egfr-binder-rd2",
-            wandb_entity="anaka_personal",
-            transform_type="rank",
-            make_negative=True,
-        )
-        logger.info(f"Trained PAE interaction expert: {pae_model_path}")
-        
-        # Return updated expert configs
-        return [
-            ExpertConfig(
-                type=ExpertType.ESM,  # This is correct
-                weight=1.0,
-                temperature=1.0,
-            ),
-            ExpertConfig(
-                type=ExpertType.iPAE,  # Changed from PAE to iPAE
-                weight=1.0,
-                temperature=1.0,
-                make_negative=True,
-                transform_type="rank",
-            ),
-        ]
 
     @staticmethod
     def should_retrain(generation: int, retrain_frequency: int = 5) -> bool:
         return generation > 0 and generation % retrain_frequency == 0
+
+    @staticmethod
+    def get_cyclic_temperature(generation: int, period: int = 5, min_temp: float = 0.5, max_temp: float = 2.0) -> float:
+        """Calculate temperature based on cosine cycle.
+        
+        Args:
+            generation: Current generation number
+            period: Number of generations per cycle
+            min_temp: Minimum temperature value
+            max_temp: Maximum temperature value
+            
+        Returns:
+            float: Current temperature value starting at min_temp
+        """
+        # Using -cos to start at minimum temperature
+        cycle_progress = -np.cos(2 * np.pi * generation / period)
+        temp_range = max_temp - min_temp
+        current_temp = min_temp + (cycle_progress + 1) * temp_range / 2
+        return current_temp
 
     @modal.method()
     def run_evolution_cycle(
@@ -103,11 +96,12 @@ class DirectedEvolution:
         max_mutations: int = -1,             # Maximum number of mutations allowed per sequence
         evoprotgrad_top_fraction: float = 0.2,    # Fraction of top sequences to consider from EvoProtGrad output
         parent_selection_temperature: float = 2.0, # Temperature for parent selection (higher = more diversity)
-        sequence_sampling_temperature: float = 2.0,# Temperature for sequence sampling (higher = more diversity)
+        temp_cycle_period: int = 5,  # New parameter for cycle period
+        min_sampling_temp: float = 0.5,  # New parameter for min temp
+        max_sampling_temp: float = 2.0,  # New parameter for max temp
         retrain_frequency: int = 5,         # How often to retrain experts (every N generations)
         seed: int = 42,                     # Random seed for reproducibility
         select_from_current_gen_only: bool = False,  # New parameter
-        ensemble_dir: str = None,
     ):
         """Run multiple cycles of directed evolution with multiple parent sequences.
         
@@ -123,7 +117,9 @@ class DirectedEvolution:
             max_mutations: Maximum number of mutations allowed per sequence
             evoprotgrad_top_fraction: Fraction of top sequences to consider from EvoProtGrad output
             parent_selection_temperature: Temperature parameter for parent selection (higher = more diversity)
-            sequence_sampling_temperature: Temperature parameter for sequence sampling (higher = more diversity)
+            temp_cycle_period: Number of generations per cycle
+            min_sampling_temp: Minimum temperature value
+            max_sampling_temp: Maximum temperature value
             retrain_frequency: How often to retrain experts (every N generations)
             seed: Random seed for reproducibility
             select_from_current_gen_only: If True, select top_k sequences only from current generation.
@@ -145,15 +141,38 @@ class DirectedEvolution:
             "max_mutations": max_mutations,
             "evoprotgrad_top_fraction": evoprotgrad_top_fraction,
             "parent_selection_temperature": parent_selection_temperature,
-            "sequence_sampling_temperature": sequence_sampling_temperature,
+            "temp_cycle_period": temp_cycle_period,
+            "min_sampling_temp": min_sampling_temp,
+            "max_sampling_temp": max_sampling_temp,
             "retrain_frequency": retrain_frequency,
             "seed": seed
         }
         metadata = EvolutionMetadata.create(config, parent_binder_seqs)
         
-        # Load ensemble if provided
-        if ensemble_dir:
-            self.ensemble = BTEnsemble.load(ensemble_dir, n_models=5)
+        expert_configs = [
+            ExpertConfig(
+                type=ExpertType.ESM, 
+                temperature=1.0,
+            ),
+            PartialEnsembleExpertConfig(
+                type=ExpertType.iPAE,
+                temperature=1.0,
+                make_negative=True,
+                transform_type="standardize",
+            ),
+            PartialEnsembleExpertConfig(
+                type=ExpertType.iPTM,
+                temperature=1.0,
+                make_negative=False,
+                transform_type="standardize",
+            ),
+            PartialEnsembleExpertConfig(
+                type=ExpertType.pLDDT,
+                temperature=1.0,
+                make_negative=False,
+                transform_type="standardize",
+            ),
+        ]
         
         for gen in range(1, generations + 1):
             logger.info(f"=== Generation {gen} ===")
@@ -167,28 +186,24 @@ class DirectedEvolution:
                 pae_model_path = self.train_bt_model.remote(
                     yvar="pae_interaction",
                     wandb_project="egfr-binder-rd2",
-                    wandb_entity="anaka",
-                    transform_type="rank",
+                    wandb_entity="anaka_personal",
+                    transform_type="standardize",
                     make_negative=True,
                 )
                 logger.info(f"Trained PAE interaction expert: {pae_model_path}")
-                
+
+                # Train iPTM expert
+                iptm_model_path = self.train_bt_model.remote(
+                    yvar="i_ptm",
+                    wandb_project="egfr-binder-rd2",
+                    wandb_entity="anaka_personal",
+                    transform_type="standardize",
+                    make_negative=False,
+                )
+                logger.info(f"Trained iPTM expert: {iptm_model_path}")
                 # Return updated expert configs
-                expert_configs = [
-                    ExpertConfig(
-                        type=ExpertType.ESM,  # This is correct
-                        weight=1.0,
-                        temperature=1.0,
-                    ),
-                    ExpertConfig(
-                        type=ExpertType.iPAE,  # Changed from PAE to iPAE
-                        weight=1.0,
-                        temperature=1.0,
-                        make_negative=True,
-                        transform_type="rank",
-                    ),
-                ]
                 logger.info("Expert retraining completed.")
+                
             
             # Calculate sequences to sample per parent
             seqs_per_parent = max(1, n_to_fold // len(current_parent_seqs))
@@ -205,25 +220,78 @@ class DirectedEvolution:
                 n_steps=n_steps,
                 max_mutations=max_mutations,
                 seed=seed + gen,
+                run_inference=True,
             )
             logger.info(f"Generated {len(evoprotgrad_df)} variant sequences")
-            
+
+            evoprotgrad_df['i_ptm_ucb_rank'] = evoprotgrad_df['i_ptm_ucb'].rank(pct=True)
+            evoprotgrad_df['pae_interaction_ucb_rank'] = evoprotgrad_df['pae_interaction_ucb'].rank(pct=True)
+            evoprotgrad_df['sequence_log_pll_rank'] = evoprotgrad_df['sequence_log_pll'].rank(pct=True)
+            evoprotgrad_df['fitness_ucb'] = (evoprotgrad_df['i_ptm_ucb'] + evoprotgrad_df['pae_interaction_ucb'] + evoprotgrad_df['sequence_log_pll_rank']) / 3
+            evoprotgrad_df = evoprotgrad_df.sort_values('fitness_ucb', ascending=False).reset_index(drop=True)
+
             # Sample sequences from the top fraction, now considering parent information
             all_variants_with_parents = []  # New list to track variants with their parents
+            logger.info(f"Sampling ~{seqs_per_parent} sequences per parent to reach total of ~{n_to_fold}")
+            logger.info(f"Using sampling temperature: {current_temp:.2f} for generation {gen}")
             for parent_idx, parent_seq in enumerate(current_parent_seqs):
                 parent_variants = evoprotgrad_df[evoprotgrad_df['parent_seq'] == parent_seq]
                 if len(parent_variants) > 0:
+                    # Calculate current temperature based on cosine cycle
+                    current_temp = self.get_cyclic_temperature(
+                        gen,
+                        period=temp_cycle_period,
+                        min_temp=min_sampling_temp,
+                        max_temp=max_sampling_temp
+                    )
+                    
+                    
                     sampled_variants = self.sample_from_evoprotgrad_sequences(
                         parent_variants,
                         top_fraction=evoprotgrad_top_fraction,
                         sample_size=seqs_per_parent,
-                        temperature=sequence_sampling_temperature
+                        temperature=current_temp
                     )
                     # Store variants with their parent information
                     all_variants_with_parents.extend([(variant, parent_seq) for variant in sampled_variants])
                     all_variants.extend(sampled_variants)
                 else:
                     logger.warning(f"No variants generated for parent sequence {parent_idx + 1}")
+            
+            # Save selected variants metrics
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            selected_variants_df = evoprotgrad_df[evoprotgrad_df['sequence'].isin(all_variants)].copy()
+            selected_variants_df['generation'] = gen
+            selected_variants_df['timestamp'] = datetime.now().isoformat()
+            
+            # Save to CSV file with timestamp in name
+            output_path = OUTPUT_DIRS['inference_results'] / f'selected_variants_metrics_gen_{gen}_{timestamp}.csv'
+            output_path.parent.mkdir(exist_ok=True)
+            selected_variants_df.to_csv(output_path, index=False)
+            logger.info(f"Saved selected variants metrics to {output_path}")
+
+            # Save PLL values in ESM2 format
+            results_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_pll_results']
+            results_dir.mkdir(parents=True, exist_ok=True)
+
+            for _, row in selected_variants_df.iterrows():
+                seq = row['sequence']
+                seq_hash = f"bdr_{hash_seq(seq)}"
+                result = {
+                    "sequence": seq,
+                    "sequence_hash": seq_hash,
+                    "sequence_log_pll": row['sequence_log_pll'],
+                    "normalized_log_pll": row['sequence_log_pll'] / len(seq),  # Approximate normalization
+                    "sequence_length": len(seq)
+                }
+                
+                result_path = results_dir / f"{seq_hash}.json"
+                with open(result_path, 'w') as f:
+                    json.dump(result, f, indent=2)
+
+            logger.info(f"Saved {len(selected_variants_df)} PLL results in ESM2 format")
+
+            
             
             # Process all variants together
             logger.info(f"\nProcessing {len(all_variants)} total variants...")
@@ -232,7 +300,19 @@ class DirectedEvolution:
             variant_seqs = [v[0] for v in all_variants_with_parents]
             parent_seqs = [v[1] for v in all_variants_with_parents]
             
+            # ensure that parent a3ms exist
+            seqs_that_need_msa = []
+            for parent_seq in parent_seqs:
+                a3m_path = get_a3m_path(parent_seq)
+                if not a3m_path.exists():
+                    seqs_that_need_msa.append(parent_seq)
             
+            seqs_that_need_msa = list(set(seqs_that_need_msa))
+            if len(seqs_that_need_msa) > 0:
+                logger.info(f"Retrieving MSA for {len(seqs_that_need_msa)} parent sequences...")
+                msa_paths = self.get_msa.remote(seqs_that_need_msa)
+                logger.info(f"Retrieved MSA for {len(msa_paths)} parent sequences")
+            volume.reload()
             
             # Get folding metrics, now passing parent sequences
             logger.info(f"Folding {len(variant_seqs)} binder sequences...")
@@ -242,8 +322,8 @@ class DirectedEvolution:
             
 
             # Get PLL metrics
-            logger.info(f"Processing sequences to obtain PLL metrics...")
-            self.process_sequences.remote()
+            # logger.info(f"Processing sequences to obtain PLL metrics...")
+            # self.process_sequences.remote()
             
             
             volume.reload()
@@ -307,6 +387,7 @@ class DirectedEvolution:
             logger.info("\nTop sequences selected for generation:")
             for idx, row in top_sequences.iterrows():
                 logger.info(
+                    f"Sequence={row['binder_sequence']} "
                     f"Sequence {idx + 1}: "
                     f"Length={len(row['binder_sequence'])}, "
                     f"Fitness={row['fitness']:.3f} "
@@ -316,7 +397,7 @@ class DirectedEvolution:
                     f"Raw: PLL={row['sequence_log_pll']:.2f}, "
                     f"iPAE={row['pae_interaction']:.2f}, "
                     f"iPTM={row['i_ptm']:.2f}, "
-                    f"Sequence={row['binder_sequence']}"
+                    
                 )
             
             # Select parents for next generation
@@ -331,13 +412,14 @@ class DirectedEvolution:
             for idx, parent in enumerate(current_parent_seqs, 1):
                 parent_metrics = top_sequences[top_sequences['binder_sequence'] == parent].iloc[0]
                 logger.info(
+                    f"Sequence={parent} "
                     f"Parent {idx}: "
                     f"Length={len(parent)}, "
                     f"PLL={parent_metrics['sequence_log_pll']:.2f}, "
                     f"PAE={parent_metrics['pae_interaction']:.2f}, "
                     f"iPTM={parent_metrics['i_ptm']:.2f}, "
                     f"Fitness={parent_metrics['fitness']:.2f}, "
-                    f"Sequence={parent}"
+                    
                 )
             
             # Store top sequences for final return
@@ -361,7 +443,14 @@ class DirectedEvolution:
                     "ipae_rank": float(row['pae_interaction_rank']),
                     "iptm": float(row['i_ptm']),
                     "iptm_rank": float(row['i_ptm_rank'])
-                } for _, row in top_sequences.iterrows()]
+                } for _, row in top_sequences.iterrows()],
+                "selected_variants": {
+                    'file_path': str(output_path),
+                    'num_variants': len(selected_variants_df),
+                    'mean_fitness_ucb': float(selected_variants_df['fitness_ucb'].mean()),
+                    'max_fitness_ucb': float(selected_variants_df['fitness_ucb'].max()),
+                    'variants_data': selected_variants_df.to_dict('records')
+                }
             }
             metadata.add_generation(gen, gen_metrics)
         
@@ -374,10 +463,10 @@ class DirectedEvolution:
     @staticmethod
     def sample_from_evoprotgrad_sequences(df, top_fraction=0.25, sample_size=10, temperature=1.0):
         """
-        Sample sequences from the top fraction based on scores.
+        Sample sequences from the top fraction based on fitness_ucb scores.
         
         Args:
-            df (pd.DataFrame): DataFrame with sequences and optionally scores
+            df (pd.DataFrame): DataFrame with sequences and fitness_ucb scores
             top_fraction (float): Fraction of top sequences to consider (0-1)
             sample_size (int): Number of sequences to sample
             temperature (float): Temperature for softmax; higher values = more diversity
@@ -388,14 +477,9 @@ class DirectedEvolution:
         # Calculate number of sequences to keep
         n_keep = max(int(len(df) * top_fraction), sample_size)
         
-        if 'score' in df.columns:
-            # If we have scores, use them for weighted sampling
-            top_df = df.nlargest(n_keep, 'score') 
-            scores = top_df['score'].values
-        else:
-            # If no scores, just randomly sample from top fraction
-            top_df = df.sample(n=n_keep)
-            scores = np.ones(len(top_df))  # Equal probabilities
+        # Use fitness_ucb for weighted sampling
+        top_df = df.nlargest(n_keep, 'fitness_ucb') 
+        scores = top_df['fitness_ucb'].values
         
         # Apply temperature scaling
         scores = scores / temperature
@@ -511,23 +595,27 @@ class UCBSequenceSelector:
 def main():
     # Define multiple parent sequences
     parent_binder_seqs = [
-       'PSFSACPSNYDGVCCNGGVCHLAESLTSYTCQCILGYSGHRVQTFDLRYTELRRR'
+    #    'SYDGYCLNGGVCMHIESLDSYTCNCIGYSGDRCQTRDLRWWELR'
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCIGYSGDRCQTRDLRWWELR'
+        'SSFSACPSSYDGICSNGGVCRYIQTLTSYTCQCPPGYTGDRCQTFDIRLLELRG',
     ] * 10
     
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
         generations=80,
-        n_to_fold=50,                # Total sequences to fold per generation
-        num_parents=25,               # Number of parents to keep
-        top_k=50,                    # Top sequences to consider
+        n_to_fold=20,                # Total sequences to fold per generation
+        num_parents=10,               # Number of parents to keep
+        top_k=100,                    # Top sequences to consider
         n_parallel_chains=16,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
         n_steps=100,                  # Steps per chain
         max_mutations=5,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.25,
         parent_selection_temperature=0.5,
-        sequence_sampling_temperature=0.5,
+        temp_cycle_period=5,  # Complete cycle every 5 generations
+        min_sampling_temp=0.,  # Minimum temperature value
+        max_sampling_temp=2.0,  # Maximum temperature value
         retrain_frequency=3,
         seed=42,
         select_from_current_gen_only=False,  # Add this parameter
