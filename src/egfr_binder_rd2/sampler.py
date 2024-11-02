@@ -209,6 +209,15 @@ class DirectedEvolution:
             seqs_per_parent = max(1, n_to_fold // len(current_parent_seqs))
             logger.info(f"Sampling {seqs_per_parent} sequences per parent to reach total of ~{n_to_fold}")
             
+            # Calculate current temperature based on cosine cycle
+            current_temp = self.get_cyclic_temperature(
+                gen,
+                period=temp_cycle_period,
+                min_temp=min_sampling_temp,
+                max_temp=max_sampling_temp
+            )
+            logger.info(f"Using sampling temperature: {current_temp:.2f} for generation {gen}")
+            
             # Process each parent sequence
             all_variants = []
             logger.info("Sampling new binder sequences using EvoProtGrad...")
@@ -233,19 +242,9 @@ class DirectedEvolution:
             # Sample sequences from the top fraction, now considering parent information
             all_variants_with_parents = []  # New list to track variants with their parents
             logger.info(f"Sampling ~{seqs_per_parent} sequences per parent to reach total of ~{n_to_fold}")
-            logger.info(f"Using sampling temperature: {current_temp:.2f} for generation {gen}")
             for parent_idx, parent_seq in enumerate(current_parent_seqs):
                 parent_variants = evoprotgrad_df[evoprotgrad_df['parent_seq'] == parent_seq]
                 if len(parent_variants) > 0:
-                    # Calculate current temperature based on cosine cycle
-                    current_temp = self.get_cyclic_temperature(
-                        gen,
-                        period=temp_cycle_period,
-                        min_temp=min_sampling_temp,
-                        max_temp=max_sampling_temp
-                    )
-                    
-                    
                     sampled_variants = self.sample_from_evoprotgrad_sequences(
                         parent_variants,
                         top_fraction=evoprotgrad_top_fraction,
