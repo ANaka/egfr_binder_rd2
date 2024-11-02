@@ -27,6 +27,10 @@ class SequenceDataModule(LightningDataModule):
     ):
         super().__init__()
         self.df = df
+        
+        # Drop rows where yvar is not a float
+        self.df = self.df[pd.to_numeric(self.df[yvar], errors='coerce').notna()].copy()
+        
         self.val_df = val_df  # Store validation df if provided
         self.tokenizer_name = tokenizer_name
         self.yvar = yvar
