@@ -39,6 +39,63 @@ with image.imports():
     import pandas as pd
     import numpy as np
 
+def get_esm2_pll(model, tokenizer, sequences: List[str], batch_size: int = 32, alpha: float = 0.1, beta: float = 0.1):
+    """
+    Run ESM2 predictions on a batch of sequences using the provided model and tokenizer.
+    
+    Args:
+        model: The ESM2 model
+        tokenizer: The ESM2 tokenizer
+        sequences: List of sequences to process
+        batch_size: Size of batches to process
+        alpha: Probability adjustment parameter
+        beta: Probability adjustment parameter
+    
+    Returns:
+        List of prediction results for each sequence
+    """
+    all_results = []
+    
+    for i in range(0, len(sequences), batch_size):
+        batch_sequences = sequences[i:i+batch_size]
+        batch_inputs = tokenizer(batch_sequences, return_tensors="pt", padding=True).to("cuda")
+
+        with torch.no_grad():
+            logits = model(**batch_inputs).logits
+
+        token_probs = torch.softmax(logits, dim=-1)
+        actual_token_probs = torch.gather(token_probs, 2, batch_inputs["input_ids"].unsqueeze(-1)).squeeze(-1)
+
+        # Apply mask-consistent probability adjustment
+        mask_consistent_probs = ((alpha + beta) / alpha) * actual_token_probs - (beta / alpha)
+        mask_consistent_probs = torch.clamp(mask_consistent_probs, min=1e-16)
+
+        pll = torch.log(mask_consistent_probs)
+
+        # Handle padding
+        mask = (batch_inputs["input_ids"] != tokenizer.pad_token_id).float()
+        sequence_lengths = mask.sum(dim=1)
+        sequence_log_pll = (pll * mask).sum(dim=1)
+        normalized_log_pll = sequence_log_pll / sequence_lengths
+
+        # Convert to CPU and numpy for each sequence in batch
+        for seq_idx in range(len(batch_sequences)):
+            seq_mask = mask[seq_idx]
+            seq_length = int(sequence_lengths[seq_idx].item())
+            
+            result = {
+                "sequence": batch_sequences[seq_idx],
+                "token_probabilities": actual_token_probs[seq_idx, :seq_length].cpu().numpy(),
+                "mask_consistent_probabilities": mask_consistent_probs[seq_idx, :seq_length].cpu().numpy(),
+                "token_log_plls": pll[seq_idx, :seq_length].cpu().numpy(),
+                "sequence_log_pll": sequence_log_pll[seq_idx].item(),
+                "normalized_log_pll": normalized_log_pll[seq_idx].item(),
+                "sequence_length": seq_length
+            }
+            all_results.append(result)
+
+    return all_results
+
 @app.cls(
     gpu="A100",
     image=image,
@@ -56,47 +113,7 @@ class ESM2Model:
 
     @modal.method()
     def predict_batch(self, sequences: List[str], batch_size: int = 32, alpha: float = 0.1, beta: float = 0.1):
-        all_results = []
-        
-        for i in range(0, len(sequences), batch_size):
-            batch_sequences = sequences[i:i+batch_size]
-            batch_inputs = self.tokenizer(batch_sequences, return_tensors="pt", padding=True).to("cuda")
-
-            with torch.no_grad():
-                logits = self.model(**batch_inputs).logits
-
-            token_probs = torch.softmax(logits, dim=-1)
-            actual_token_probs = torch.gather(token_probs, 2, batch_inputs["input_ids"].unsqueeze(-1)).squeeze(-1)
-
-            # Apply mask-consistent probability adjustment
-            mask_consistent_probs = ((alpha + beta) / alpha) * actual_token_probs - (beta / alpha)
-            mask_consistent_probs = torch.clamp(mask_consistent_probs, min=1e-16)
-
-            pll = torch.log(mask_consistent_probs)
-
-            # Handle padding
-            mask = (batch_inputs["input_ids"] != self.tokenizer.pad_token_id).float()
-            sequence_lengths = mask.sum(dim=1)
-            sequence_log_pll = (pll * mask).sum(dim=1)
-            normalized_log_pll = sequence_log_pll / sequence_lengths
-
-            # Convert to CPU and numpy for each sequence in batch
-            for seq_idx in range(len(batch_sequences)):
-                seq_mask = mask[seq_idx]
-                seq_length = int(sequence_lengths[seq_idx].item())
-                
-                result = {
-                    "sequence": batch_sequences[seq_idx],
-                    "token_probabilities": actual_token_probs[seq_idx, :seq_length].cpu().numpy(),
-                    "mask_consistent_probabilities": mask_consistent_probs[seq_idx, :seq_length].cpu().numpy(),
-                    "token_log_plls": pll[seq_idx, :seq_length].cpu().numpy(),
-                    "sequence_log_pll": sequence_log_pll[seq_idx].item(),
-                    "normalized_log_pll": normalized_log_pll[seq_idx].item(),
-                    "sequence_length": seq_length
-                }
-                all_results.append(result)
-
-        return all_results
+        return get_esm2_pll(self.model, self.tokenizer, sequences, batch_size, alpha, beta)
 
 @app.function(image=image,
     timeout=9600,
@@ -216,8 +233,6 @@ def update_pll_metrics():
                     'sequence_length': result['sequence_length'],
                     'normalized_log_pll': result['normalized_log_pll'],
                     'sequence_log_pll': result['sequence_log_pll'],
-                    'mean_token_probability': float(np.mean(result['token_probabilities'])),
-                    'min_token_probability': float(np.min(result['token_probabilities'])),
                 }
                 new_results.append(metrics)
     
