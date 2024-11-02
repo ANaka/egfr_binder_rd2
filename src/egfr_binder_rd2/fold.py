@@ -607,7 +607,7 @@ def update_metrics_for_all_folded(overwrite: bool = False):
     existing_metrics = {}
     if metrics_csv_path.exists() and not overwrite:
         df = pd.read_csv(metrics_csv_path)
-        existing_metrics = {row['hash']: row for _, row in df.iterrows()}
+        existing_metrics = df.to_dict('records')  # Convert to list of dicts properly
     
     # Collect all metrics
     all_metrics = []
@@ -617,10 +617,12 @@ def update_metrics_for_all_folded(overwrite: bool = False):
         seq_hash = pdb_path.stem.split('_')[0]  # Extract hash from filename
         
         # Skip if already processed and not overwriting
-        if seq_hash in existing_metrics and not overwrite:
-            all_metrics.append(existing_metrics[seq_hash])
-            continue
-            
+        if not overwrite:
+            existing_metric = next((m for m in existing_metrics if m['seq_hash'] == seq_hash), None)
+            if existing_metric:
+                all_metrics.append(existing_metric)
+                continue
+
         try:
             metrics = get_metrics_from_hash(seq_hash)
             if metrics:  # Only add if we got valid metrics
@@ -632,9 +634,30 @@ def update_metrics_for_all_folded(overwrite: bool = False):
         if (i + 1) % 10 == 0:
             logger.info(f"Processed {i + 1}/{len(pdb_files)} PDB files")
     
-    # Convert to DataFrame and save
+    # Convert to DataFrame
     if all_metrics:
         df = pd.DataFrame(all_metrics)
+        
+        # Check for missing sequence indices
+        sequence_index_columns = ['binder_hydrophobicity', 'binder_hydropathy', 'binder_solubility']
+        missing_indices = df[sequence_index_columns].isna().any(axis=1)
+        
+        if missing_indices.any():
+            logger.info(f"Found {missing_indices.sum()} rows with missing sequence indices")
+            
+            # Calculate missing indices
+            for idx in df[missing_indices].index:
+                if 'binder_sequence' in df.columns and pd.notna(df.loc[idx, 'binder_sequence']):
+                    sequence = df.loc[idx, 'binder_sequence']
+                    indices = calculate_sequence_indices(sequence)
+                    
+                    df.loc[idx, 'binder_hydrophobicity'] = indices['avg_hydrophobicity']
+                    df.loc[idx, 'binder_hydropathy'] = indices['avg_hydropathy']
+                    df.loc[idx, 'binder_solubility'] = indices['avg_solubility']
+            
+            logger.info("Updated missing sequence indices")
+        
+        # Save updated DataFrame
         df.to_csv(metrics_csv_path, index=False)
         logger.info(f"Updated metrics saved to {metrics_csv_path}")
     else:
@@ -857,7 +880,8 @@ def fold_binder_high_quality(binder_seq: str, target_seq: str=OFFICIAL_EGFR) -> 
 @app.local_entrypoint()
 def test_high_quality_fold():
     """Test the high quality folding functionality."""
-    test_seq = EGFS  # Using the example binder sequence
+    # test_seq = EGFS  # Using the example binder sequence
+    test_seq = 'SLFSICPYRYHGICKNNGVCRYAINLRSYTCQCVSGYTGARCQEADIRYLLLRI'
     result = fold_binder_high_quality.remote(test_seq)
     print(f"High quality folding results: {result}")
 
