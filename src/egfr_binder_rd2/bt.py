@@ -15,7 +15,7 @@ from egfr_binder_rd2.utils import hash_seq
 from typing import List, Dict, Optional
 import numpy as np
 from dataclasses import dataclass
-from esm.modules import TransformerLayer
+# from esm.modules import TransformerLayer
 # Utility functions
 def create_pairwise_comparisons(batch, outputs, label):
     device = outputs.device
@@ -367,7 +367,8 @@ class PartialEnsembleModule(pl.LightningModule):
         peft_alpha: int = 16,
         max_length: int = 512,
         xvar: str = 'binder_sequence',
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        explore_weight: float = 0.2,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -376,7 +377,7 @@ class PartialEnsembleModule(pl.LightningModule):
         
         self.label = label
         self.max_length = max_length
-        
+        self.explore_weight = explore_weight
         # Initialize base components
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.esm_model = self._initialize_model(model_name, peft_r, peft_alpha)
@@ -432,6 +433,7 @@ class PartialEnsembleModule(pl.LightningModule):
         batch["head_predictions"] = head_predictions
         batch["predictions"] = mean_pred
         batch["uncertainties"] = std_pred
+        batch['ucb'] = mean_pred + self.explore_weight * std_pred
         return batch
 
     def _compute_loss(self, head_predictions, targets):
@@ -498,3 +500,66 @@ class PartialEnsembleModule(pl.LightningModule):
             'sequence': batch[self.hparams.xvar],
             'target': batch[self.label],
         }
+
+    def save_model(self, save_path: str):
+        """Save both PEFT adapter, ensemble heads, and pooler state"""
+        adapter_state_dict = get_peft_model_state_dict(self.esm_model)
+        ensemble_state_dict = self.ensemble_heads.state_dict()
+        pooler_state_dict = self.esm_model.pooler.state_dict()  # Save pooler state
+
+        save_dict = {
+            'adapter_state_dict': adapter_state_dict,
+            'ensemble_state_dict': ensemble_state_dict,
+            'pooler_state_dict': pooler_state_dict,  # Include pooler state
+            'hparams': dict(self.hparams),
+            'model_name': self.hparams.model_name,
+        }
+
+        torch.save(save_dict, save_path)
+        print(f"Model saved to: {save_path}")
+        print(f"Adapter state dict keys: {list(adapter_state_dict.keys())}")
+        print(f"Ensemble state dict keys: {list(ensemble_state_dict.keys())}")
+        print(f"Pooler state dict keys: {list(pooler_state_dict.keys())}")
+
+    @classmethod
+    def load_model(cls, load_path: str):
+        """Load a saved model including PEFT adapter, ensemble heads, and pooler state"""
+        saved_dict = torch.load(load_path)
+
+        # Initialize model with saved hyperparameters
+        model = cls(**saved_dict['hparams'])
+
+        # Load PEFT adapter
+        set_peft_model_state_dict(model.esm_model, saved_dict['adapter_state_dict'])
+
+        # Load ensemble heads
+        model.ensemble_heads.load_state_dict(saved_dict['ensemble_state_dict'])
+
+        # Load pooler state
+        model.esm_model.pooler.load_state_dict(saved_dict['pooler_state_dict'])
+
+        # Set to eval mode
+        model.eval()
+
+        print(f"Model loaded from: {load_path}")
+        print(f"Loaded adapter state dict keys: {list(saved_dict['adapter_state_dict'].keys())}")
+        print(f"Loaded ensemble state dict keys: {list(saved_dict['ensemble_state_dict'].keys())}")
+        print(f"Loaded pooler state dict keys: {list(saved_dict['pooler_state_dict'].keys())}")
+
+        return model
+
+    @classmethod
+    def load_from_wandb(cls, run_path: str, model_artifact_name: str, run = None):
+        """Load model from wandb artifact"""
+        if run is None:
+            api = wandb.Api()
+            artifact = api.artifact(f'{run_path}/{model_artifact_name}:latest')
+            artifact_dir = artifact.download()
+        else:
+            artifact = run.use_artifact(f'{model_artifact_name}:latest')
+            artifact_dir = artifact.download()
+
+        model_path = os.path.join(artifact_dir, os.listdir(artifact_dir)[0])
+        model = cls.load_model(model_path)
+        model.current_run_path = f'{artifact.entity}/{artifact.project}/{artifact.source_name}'
+        return model
