@@ -67,10 +67,10 @@ if __name__ == "__main__":
 
 
 # # Download structure files
-# modal volume get egfr_binders folded /home/naka/code/egfr_binder_rd2/data/colabfold_outputs/folded/
+# modal volume get egfr_binders folded /home/naka/code/egfr_binder_rd2/data/colabfold_outputs/
 
 # # Download MSA files
-# modal volume get egfr_binders msa_results /home/naka/code/egfr_binder_rd2/data/colabfold_outputs/msa_results/
+# modal volume get egfr_binders msa_results /home/naka/code/egfr_binder_rd2/data/colabfold_outputs/
 
 # # Upload structure files
 # modal volume put egfr_binders /home/naka/code/egfr_binder_rd2/data/colabfold_outputs/folded/  folded
