@@ -77,7 +77,7 @@ class DirectedEvolution:
             float: Current temperature value starting at min_temp
         """
         # Using -cos to start at minimum temperature
-        cycle_progress = -np.cos(2 * np.pi * generation / period)
+        cycle_progress = -np.cos(2 * np.pi * (generation-1) / period)
         temp_range = max_temp - min_temp
         current_temp = min_temp + (cycle_progress + 1) * temp_range / 2
         return current_temp
@@ -598,6 +598,7 @@ def main():
     #    'SYDGYCLNGGVCMHIESLDSYTCNCIGYSGDRCQTRDLRWWELR'
         # 'SYDGYCLNGGVCMHIESLDSYTCNCIGYSGDRCQTRDLRWWELR'
         'SSFSACPSSYDGICSNGGVCRYIQTLTSYTCQCPPGYTGDRCQTFDIRLLELRG',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELR',
     ] * 10
     
     evolution = DirectedEvolution()
