@@ -210,6 +210,7 @@ class MSAQuery:
             logger.info(f"MSA generation output: {result.stdout}")
 
             a3m_path = out_dir / f"{input_path.stem}.a3m"
+            volume.commit()
             return a3m_path
         except subprocess.CalledProcessError as e:
             logger.error(f"MSA generation failed with error: {e}")
@@ -232,6 +233,7 @@ class MSAQuery:
         
         # query_msa_server returns a single a3m path, not a directory
         a3m_path = self.query_msa_server.remote(fasta_path, out_dir)
+        volume.commit()
         return [a3m_path]  # Return as list to maintain interface
 
 
@@ -252,7 +254,9 @@ def get_msa_for_binder(binder_seqs: List[str], target_seq: str=EGFR) -> List[Pat
     """
     paired_seqs = [f'{binder}:{target_seq}' for binder in binder_seqs]
     msa = MSAQuery()
-    return msa.run_msa_generation.remote(paired_seqs)
+    msa_paths = msa.run_msa_generation.remote(paired_seqs)
+    volume.commit()
+    return msa_paths
 
 
 
@@ -294,7 +298,7 @@ def test_msa_server_query():
     result_files = msa.run_msa_generation.remote(test_sequences)
     print(f"MSA results saved to: {[str(p) for p in result_files]}")
 
-def get_a3m_path(binder_seq: str, target_seq: str) -> Path:
+def get_a3m_path(binder_seq: str, target_seq: str=EGFR) -> Path:
     seq_hash = hash_seq(f'{binder_seq}:{target_seq}')
     return Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"] / f"{seq_hash}.a3m"
 
