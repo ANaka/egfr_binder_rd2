@@ -1,5 +1,5 @@
 import modal
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import logging
 import pandas as pd
 import torch
@@ -7,6 +7,7 @@ from datetime import datetime
 import numpy as np
 import json
 from pathlib import Path
+import time
 
 from egfr_binder_rd2.bt import BTEnsemble
 from egfr_binder_rd2 import LOGGING_CONFIG, MODAL_VOLUME_PATH, OUTPUT_DIRS, ExpertType, ExpertConfig, EvolutionMetadata, PartialEnsembleExpertConfig
@@ -34,6 +35,31 @@ wandb_secret = modal.Secret.from_name("anaka_personal_wandb_api_key")
 
 with image.imports():
     import numpy as np
+
+def safe_log_metrics(df: pd.DataFrame, metric_name: str, logger: logging.Logger) -> Dict[str, Any]:
+    """Safely extract and log metrics, returning default values if columns don't exist."""
+    try:
+        if metric_name == 'pae_interaction':
+            mean = df['pae_interaction_mean'].mean()
+            std = df['pae_interaction_std'].mean()
+            ucb = df['pae_interaction_ucb'].mean()
+            return {'mean': mean, 'std': std, 'ucb': ucb}
+        elif metric_name == 'i_ptm':
+            mean = df['i_ptm_mean'].mean()
+            std = df['i_ptm_std'].mean()
+            ucb = df['i_ptm_ucb'].mean()
+            return {'mean': mean, 'std': std, 'ucb': ucb}
+        elif metric_name == 'binder_plddt':
+            mean = df['binder_plddt_mean'].mean()
+            std = df['binder_plddt_std'].mean()
+            return {'mean': mean, 'std': std}
+        else:
+            mean = df[metric_name].mean()
+            std = df[metric_name].std() if f'{metric_name}_std' in df else None
+            return {'mean': mean, 'std': std}
+    except KeyError as e:
+        logger.error(f"Failed to extract {metric_name} metrics: {str(e)}")
+        return {'mean': None, 'std': None, 'ucb': None}
 
 @app.cls(
     image=image,
@@ -244,8 +270,42 @@ class DirectedEvolution:
             selected_variants_df['generation'] = gen
             selected_variants_df['timestamp'] = datetime.now().isoformat()
             
+            # Log inference predictions before folding
+            logger.info("\nInference Predictions for Selected Sequences:")
+            logger.info(f"Number of sequences selected for folding: {len(selected_variants_df)}")
+            logger.info("\nPredicted Metrics Statistics:")
+            try:
+                pae_metrics = safe_log_metrics(selected_variants_df, 'pae_interaction', logger)
+                ptm_metrics = safe_log_metrics(selected_variants_df, 'i_ptm', logger)
+                plddt_metrics = safe_log_metrics(selected_variants_df, 'binder_plddt', logger)
+                pll_metrics = safe_log_metrics(selected_variants_df, 'sequence_log_pll', logger)
+
+                if pae_metrics['mean'] is not None:
+                    logger.info(f"iPAE (mean ± std): {pae_metrics['mean']:.2f} ± {pae_metrics['std']:.2f}")
+                    logger.info(f"iPAE UCB: {pae_metrics['ucb']:.2f}")
+                if ptm_metrics['mean'] is not None:
+                    logger.info(f"iPTM (mean ± std): {ptm_metrics['mean']:.2f} ± {ptm_metrics['std']:.2f}")
+                    logger.info(f"iPTM UCB: {ptm_metrics['ucb']:.2f}")
+                if plddt_metrics['mean'] is not None:
+                    logger.info(f"pLDDT (mean ± std): {plddt_metrics['mean']:.2f} ± {plddt_metrics['std']:.2f}")
+                if pll_metrics['mean'] is not None:
+                    logger.info(f"PLL: {pll_metrics['mean']:.2f}")
+            except Exception as e:
+                logger.error(f"Error logging metrics statistics: {str(e)}")
+
+            # Log a few example sequences with their predictions
+            for _, row in selected_variants_df.iterrows():
+                logger.info(
+                   
+                    f"bt iPAE={row['pae_interaction_mean']:.2f} (UCB={row['pae_interaction_ucb']:.2f}), "
+                    f"bt iPTM={row['i_ptm_mean']:.2f} (UCB={row['i_ptm_ucb']:.2f}), "
+                    f"bt pLDDT={row['binder_plddt_mean']:.2f}, "
+                    f"PLL={row['sequence_log_pll']:.2f} "
+                    f"Sequence={row['sequence']} "
+                )
+
             # Save to CSV file with timestamp in name
-            output_path = OUTPUT_DIRS['inference_results'] / f'selected_variants_metrics_gen_{gen}_{timestamp}.csv'
+            output_path = MODAL_VOLUME_PATH / OUTPUT_DIRS['inference_results'] / f'selected_variants_metrics_gen_{gen}_{timestamp}.csv'
             output_path.parent.mkdir(exist_ok=True)
             selected_variants_df.to_csv(output_path, index=False)
             logger.info(f"Saved selected variants metrics to {output_path}")
@@ -297,7 +357,6 @@ class DirectedEvolution:
             # Get folding metrics, now passing parent sequences
             logger.info(f"Folding {len(variant_seqs)} binder sequences...")
             fold_results = self.parallel_fold_binder.remote(variant_seqs, parent_seqs)
-            logger.info(fold_results)
             volume.reload()
             
 
@@ -318,26 +377,51 @@ class DirectedEvolution:
             combined_df = pll_df.merge(metrics_df, left_on='sequence', right_on='binder_sequence', how="inner")
             logger.info(f"Successfully merged metrics for {len(combined_df)} sequences")
             
-            # Filter for current generation if requested
+            # Add retry logic for current generation sequences
+            max_retries = 3
+            retry_delay = 30  # seconds
+            
             if select_from_current_gen_only:
-                logger.info(f"Calculating fitness using only current generation sequences")
-                logger.info(f'Current generation sequences: {all_variants}')
-                ranking_df = combined_df[combined_df['binder_sequence'].isin(all_variants)]
-                logger.info(f"Found {len(ranking_df)} sequences from current generation")
+                expected_sequences = len(all_variants)  # Number of sequences we expect to have folded
+                for attempt in range(max_retries):
+                    logger.info(f"Attempt {attempt + 1}/{max_retries}: Calculating fitness using current generation sequences")
+                    logger.info(f'Current generation sequences: {len(all_variants)} expected')
+                    ranking_df = combined_df[combined_df['binder_sequence'].isin(all_variants)].copy()  # Make explicit copy
+                    logger.info(f"Found {len(ranking_df)}/{expected_sequences} sequences from current generation")
+                    
+                    if len(ranking_df) >= expected_sequences * 0.9:  # Allow for 10% failure rate
+                        break
+                    
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Missing {expected_sequences - len(ranking_df)} sequences. Waiting {retry_delay} seconds before retry...")
+                        time.sleep(retry_delay)
+                        # Reload the metrics
+                        volume.reload()
+                        metrics_df = self.update_metrics.remote()
+                        pll_df = self.update_pll_metrics.remote()
+                        combined_df = pll_df.merge(metrics_df, left_on='sequence', right_on='binder_sequence', how="inner")
+                
+                if len(ranking_df) < expected_sequences * 0.5:  # If we have less than 50% of expected sequences
+                    logger.warning(f"Only found {len(ranking_df)}/{expected_sequences} sequences after retries. Falling back to using all historical sequences.")
+                    ranking_df = combined_df
+                else:
+                    logger.info(f"Proceeding with {len(ranking_df)}/{expected_sequences} sequences from current generation")
+
             else:
                 logger.info("Calculating fitness using all historical sequences")
-                ranking_df = combined_df
+                ranking_df = combined_df.copy()  # Make explicit copy
                 logger.info(f"Using all {len(ranking_df)} historical sequences")
 
             if len(ranking_df) == 0:
                 logger.warning("No sequences found for ranking. Using parent sequences for next generation.")
-                return current_parent_seqs
-            
+                current_parent_seqs = current_parent_seqs
+                continue
+
             # Calculate ranks and fitness
-            ranking_df['pae_interaction_rank'] = 1 - ranking_df['pae_interaction'].rank(pct=True)
-            ranking_df['i_ptm_rank'] = ranking_df['i_ptm'].rank(pct=True)
-            ranking_df['sequence_log_pll_rank'] = ranking_df['sequence_log_pll'].rank(pct=True)
-            ranking_df['fitness'] = (
+            ranking_df.loc[:, 'pae_interaction_rank'] = 1 - ranking_df['pae_interaction'].rank(pct=True)
+            ranking_df.loc[:, 'i_ptm_rank'] = ranking_df['i_ptm'].rank(pct=True)
+            ranking_df.loc[:, 'sequence_log_pll_rank'] = ranking_df['sequence_log_pll'].rank(pct=True)
+            ranking_df.loc[:, 'fitness'] = (
                 ranking_df['pae_interaction_rank'] + 
                 ranking_df['i_ptm_rank'] + 
                 ranking_df['sequence_log_pll_rank']
@@ -345,7 +429,8 @@ class DirectedEvolution:
             
             # Sort by fitness
             ranking_df = ranking_df.sort_values('fitness', ascending=False).reset_index(drop=True)
-            
+            logger.info(f"Successfully ranked {len(ranking_df)} sequences")
+
             # Log statistics for this generation
             logger.info("\nGeneration Statistics:")
             logger.info(f"Mean PLL: {combined_df['sequence_log_pll'].mean():.2f}")
@@ -368,7 +453,7 @@ class DirectedEvolution:
             for idx, row in top_sequences.iterrows():
                 logger.info(
                     f"Sequence={row['binder_sequence']} "
-                    f"Sequence {idx + 1}: "
+                    f"Sequence {idx + 1:03d}: "
                     f"Length={len(row['binder_sequence'])}, "
                     f"Fitness={row['fitness']:.3f} "
                     f"(PLL_rank={row['sequence_log_pll_rank']:.3f}, "
@@ -393,7 +478,7 @@ class DirectedEvolution:
                 parent_metrics = top_sequences[top_sequences['binder_sequence'] == parent].iloc[0]
                 logger.info(
                     f"Sequence={parent} "
-                    f"Parent {idx}: "
+                    f"Parent {idx:03d}: "
                     f"Length={len(parent)}, "
                     f"PLL={parent_metrics['sequence_log_pll']:.2f}, "
                     f"PAE={parent_metrics['pae_interaction']:.2f}, "
@@ -423,20 +508,67 @@ class DirectedEvolution:
                     "ipae_rank": float(row['pae_interaction_rank']),
                     "iptm": float(row['i_ptm']),
                     "iptm_rank": float(row['i_ptm_rank'])
-                } for _, row in top_sequences.iterrows()],
-                "selected_variants": {
-                    'file_path': str(output_path),
-                    'num_variants': len(selected_variants_df),
-                    'mean_fitness_ucb': float(selected_variants_df['fitness_ucb'].mean()),
-                    'max_fitness_ucb': float(selected_variants_df['fitness_ucb'].max()),
-                    'variants_data': selected_variants_df.to_dict('records')
-                }
+                } for _, row in top_sequences.iterrows()]
             }
             metadata.add_generation(gen, gen_metrics)
-        
+
+            # When comparing predicted vs actual metrics
+            logger.info("\nComparing predicted vs actual metrics:")
+
+            # Get predictions from EvoProtGrad for the folded sequences
+            predictions_df = selected_variants_df[selected_variants_df['sequence'].isin(variant_seqs)]
+            actuals_df = combined_df[combined_df['binder_sequence'].isin(variant_seqs)]
+
+            if len(predictions_df) > 0 and len(actuals_df) > 0:
+                # Calculate average metrics
+                try:
+                    pred_metrics = {
+                        'pae_interaction': predictions_df['pae_interaction_mean'].mean(),
+                        'i_ptm': predictions_df['i_ptm_mean'].mean(),
+                        'pll': predictions_df['sequence_log_pll'].mean(),
+                    }
+                    
+                    actual_metrics = {
+                        'pae_interaction': actuals_df['pae_interaction_mean'].mean(),
+                        'i_ptm': actuals_df['i_ptm_mean'].mean(),
+                        'pll': actuals_df['sequence_log_pll'].mean(),
+                    }
+                    
+                    logger.info("Average metrics comparison (predicted vs actual):")
+                    logger.info(f"iPAE: {pred_metrics['pae_interaction']:.2f} vs {actual_metrics['pae_interaction']:.2f}")
+                    logger.info(f"iPTM: {pred_metrics['i_ptm']:.2f} vs {actual_metrics['i_ptm']:.2f}")
+                    logger.info(f"PLL: {pred_metrics['pll']:.2f} vs {actual_metrics['pll']:.2f}")
+                except Exception as e:
+                    logger.error(f"Error calculating average metrics: {str(e)}")
+
+                # Calculate correlations
+                try:
+                    merged_df = predictions_df.merge(
+                        actuals_df,
+                        left_on='sequence',
+                        right_on='binder_sequence',
+                        suffixes=('', '_actual')
+                    )
+                    
+                    if len(merged_df) > 1:  # Need at least 2 points for correlation
+                        pae_corr = np.corrcoef(merged_df['pae_interaction_mean'], merged_df['pae_interaction_mean_actual'])[0,1]
+                        ptm_corr = np.corrcoef(merged_df['i_ptm_mean'], merged_df['i_ptm_mean_actual'])[0,1]
+                        pll_corr = np.corrcoef(merged_df['sequence_log_pll'], merged_df['sequence_log_pll_actual'])[0,1]
+                        
+                        logger.info("\nCorrelations between predicted and actual values:")
+                        logger.info(f"iPAE correlation: {pae_corr:.3f}")
+                        logger.info(f"iPTM correlation: {ptm_corr:.3f}")
+                        logger.info(f"PLL correlation: {pll_corr:.3f}")
+                    else:
+                        logger.warning("Not enough matched sequences to calculate correlations")
+                except Exception as e:
+                    logger.error(f"Error calculating correlations: {str(e)}")
+            else:
+                logger.warning("Not enough data to compare predicted vs actual metrics")
+
         logger.info("Directed evolution cycle completed.")
         # Save metadata
-        metadata.save(OUTPUT_DIRS["evolution_trajectories"])
+        metadata.save(MODAL_VOLUME_PATH /OUTPUT_DIRS["evolution_trajectories"])
         return list(set(all_final_sequences))  # Remove duplicates
 
 
@@ -574,32 +706,44 @@ class UCBSequenceSelector:
 @app.local_entrypoint()
 def main():
     # Define multiple parent sequences
+    # parent_binder_seqs = [
+    # #    'SYDGYCLNGGVCMHIESLDSYTCNCIGYSGDRCQTRDLRWWELR'
+    #     # 'SYDGYCLNGGVCMHIESLDSYTCNCIGYSGDRCQTRDLRWWELR'
+    #     # 'SSFSACPSSYDGICSNGGVCRYIQTLTSYTCQCPPGYTGDRCQTFDIRLLELRG',
+    #     'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELR',
+    # ] * 10
     parent_binder_seqs = [
-    #    'SYDGYCLNGGVCMHIESLDSYTCNCIGYSGDRCQTRDLRWWELR'
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCIGYSGDRCQTRDLRWWELR'
-        'SSFSACPSSYDGICSNGGVCRYIQTLTSYTCQCPPGYTGDRCQTFDIRLLELRG',
-        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELR',
-    ] * 10
+        # 'SYDGYCLNGCIGYSGDRCQTRDLRWWELR',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELR', 
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRR', 
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRR',
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRR',
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRR',
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRR',
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRR',
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRRR',
+        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRRRR',
+    ]
     
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
         generations=80,
-        n_to_fold=30,                # Total sequences to fold per generation
-        num_parents=10,               # Number of parents to keep
+        n_to_fold=10,                # Total sequences to fold per generation
+        num_parents=1,               # Number of parents to keep
         top_k=200,                    # Top sequences to consider
         n_parallel_chains=16,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
-        n_steps=100,                  # Steps per chain
+        n_steps=50,                  # Steps per chain
         max_mutations=5,             # Max mutations per sequence
-        evoprotgrad_top_fraction=0.25,
-        parent_selection_temperature=1,
+        evoprotgrad_top_fraction=0.4,
+        parent_selection_temperature=0.5,
         temp_cycle_period=5,  # Complete cycle every 5 generations
         min_sampling_temp=0.3,  # Minimum temperature value
         max_sampling_temp=2.0,  # Maximum temperature value
         retrain_frequency=3,
         seed=42,
-        select_from_current_gen_only=False,  # Add this parameter
+        select_from_current_gen_only=True,  # Add this parameter
     )
     
     print(f"Final evolved sequences: {final_sequences}")
