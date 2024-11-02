@@ -31,11 +31,18 @@ class EsmRegressionExpert(AttributeExpert):
             device=device,
             tokenizer=None,
         )
+        self.is_peft = False
 
         self.tokenizer = tokenizer
-        self.model.esm_model.esm.embeddings.word_embeddings = (
-            embeddings.OneHotEmbedding(model.esm_model.esm.embeddings.word_embeddings)
-        )
+        try:
+            self.model.esm_model.esm.embeddings.word_embeddings = (
+                embeddings.OneHotEmbedding(model.esm_model.esm.embeddings.word_embeddings)
+            )
+        except:
+            self.model.esm_model.base_model.model.embeddings.word_embeddings = (
+                embeddings.OneHotEmbedding(model.esm_model.base_model.model.embeddings.word_embeddings)
+            )
+            self.is_peft = True
 
         # Create the expert_to_canonical_order tensor
         self.expert_to_canonical_order = utils.expert_alphabet_to_canonical(
@@ -43,7 +50,10 @@ class EsmRegressionExpert(AttributeExpert):
         )
 
     def _get_last_one_hots(self) -> torch.Tensor:
-        return self.model.esm_model.esm.embeddings.word_embeddings.one_hots
+        if self.is_peft:
+            return self.model.esm_model.base_model.model.embeddings.word_embeddings.one_hots
+        else:
+            return self.model.esm_model.esm.embeddings.word_embeddings.one_hots
 
     def tokenize(self, inputs: List[str]):
         return self.tokenizer(
