@@ -370,17 +370,22 @@ def fold_binder(binder_seqs: Union[str, List[str]], parent_binder_seqs: Union[st
     # Convert single sequences to lists for consistent handling
     if isinstance(binder_seqs, str):
         binder_seqs = [binder_seqs]
-    if isinstance(parent_binder_seqs, str):
+    
+    # Handle parent sequences
+    if parent_binder_seqs is None:
+        # If no parent sequences provided, use binder sequences as their own parents
+        parent_binder_seqs = binder_seqs
+    elif isinstance(parent_binder_seqs, str):
+        # If single parent sequence, replicate it for all binders
         parent_binder_seqs = [parent_binder_seqs] * len(binder_seqs)
-    elif parent_binder_seqs is not None and len(parent_binder_seqs) == 1:
+    elif len(parent_binder_seqs) == 1:
+        # If list with single parent, replicate it for all binders
         parent_binder_seqs = parent_binder_seqs * len(binder_seqs)
     
     logger.info(f"Folding sequences: {binder_seqs}")
     logger.info(f"Using parent sequences: {parent_binder_seqs}")
     
     # First, ensure we have MSAs for all sequences
-
-    # If parent sequences match binder sequences exactly, generate new MSAs
     if binder_seqs == parent_binder_seqs:
         logger.info("Binder sequences match parent sequences, generating new MSAs")
         a3m_paths = get_msa_for_binder.remote(binder_seqs, target_seq)
