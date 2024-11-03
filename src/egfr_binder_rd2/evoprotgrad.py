@@ -32,6 +32,7 @@ from egfr_binder_rd2 import (
     ExpertType,
     ExpertConfig,
     PartialEnsembleExpertConfig,
+    DEFAULT_EXPERT_CONFIGS,
 )
 from egfr_binder_rd2.datamodule import SequenceDataModule
 from egfr_binder_rd2.bt import BTRegressionModule, PartialEnsembleModule
@@ -140,41 +141,10 @@ def get_latest_adapter(base_path: Path, yvar: str, transform_type: str, use_ense
     return adapter_files[0]
 
 def create_experts(expert_configs: Optional[List[ExpertConfig]], device: str) -> List[Any]:
-    """Create multiple experts based on configurations.
-    
-    Args:
-        expert_configs: List of expert configurations
-        device: Device to run the experts on ('cuda' or 'cpu')
-        
-    Returns:
-        List of initialized experts
-    """
+    """Create multiple experts based on configurations."""
     # Use default configuration if none provided
     if expert_configs is None:
-        expert_configs = [
-            ExpertConfig(
-                type=ExpertType.ESM, 
-                temperature=1.0,
-            ),
-            PartialEnsembleExpertConfig(
-                type=ExpertType.iPAE,
-                temperature=1.0,
-                make_negative=True,
-                transform_type="standardize",
-            ),
-            PartialEnsembleExpertConfig(
-                type=ExpertType.iPTM,
-                temperature=1.0,
-                make_negative=False,
-                transform_type="standardize",
-            ),
-            PartialEnsembleExpertConfig(
-                type=ExpertType.pLDDT,
-                temperature=1.0,
-                make_negative=False,
-                transform_type="standardize",
-            ),
-        ]
+        expert_configs = DEFAULT_EXPERT_CONFIGS
     
     # Create experts
     experts = []
@@ -259,9 +229,10 @@ def train_bt_model(
     
     # Load dataset
     logger.info("Loading dataset...")
-    old_df = pd.read_csv(Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["rd1_fold_df"])
+    # old_df = pd.read_csv(Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["rd1_fold_df"])
     df = pd.read_csv(Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["metrics_csv"])
-    df = df.merge(old_df, how='outer')
+    plls = pd.read_csv(Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["esm2_exact_pll_metrics"])
+    df = df.merge(plls, left_on='binder_sequence', right_on='sequence')
 
     # TODO add in stuff from newly folded sequences here
     
@@ -440,33 +411,77 @@ def train_bt_model(
     volumes={MODAL_VOLUME_PATH: volume},
     secrets=[wandb_secret],
 )
-async def train_experts_async():
-    """Train all experts in parallel."""
-    # Train models concurrently
-    pae_task = train_bt_model.remote.aio(
+def train_experts_async():
+    """Launch training tasks asynchronously without waiting."""
+    # Launch tasks using spawn() to avoid waiting for completion
+    train_bt_model.remote(
         yvar="pae_interaction",
-        wandb_project="egfr-binder-rd2",
+        wandb_project="egfr-binder-rd2", 
         wandb_entity="anaka_personal",
         transform_type="standardize",
         make_negative=True,
+        seed=117,
+        use_ensemble=True,
+        num_heads=10,
+        dropout=0.15,
+        explore_weight=0.2,
+        max_epochs=20,
     )
     
-    iptm_task = train_bt_model.remote.aio(
+    train_bt_model.remote(
         yvar="i_ptm",
         wandb_project="egfr-binder-rd2",
-        wandb_entity="anaka_personal",
+        wandb_entity="anaka_personal", 
         transform_type="standardize",
         make_negative=False,
+        seed=117,
+        use_ensemble=True,
+        num_heads=10,
+        dropout=0.15,
+        explore_weight=0.2,
+        max_epochs=20,
     )
     
-    plddt_task = train_bt_model.remote.aio(
+    train_bt_model.remote(
         yvar="binder_plddt",
         wandb_project="egfr-binder-rd2",
         wandb_entity="anaka_personal",
+        transform_type="standardize", 
+        make_negative=False,
+        seed=117,
+        use_ensemble=True,
+        num_heads=10,
+        dropout=0.15,
+        explore_weight=0.2,
+        max_epochs=10,
+    )
+    train_bt_model.remote(
+        yvar="binder_hydropathy",
+        wandb_project="egfr-binder-rd2",
+        wandb_entity="anaka_personal",
+        transform_type="standardize", 
+        make_negative=True,
+        seed=117,
+        use_ensemble=True,
+        num_heads=3,
+        dropout=0.15,
+        explore_weight=0.,
+        max_epochs=10,
+    )
+
+    train_bt_model.remote(
+        yvar="sequence_log_pll",
+        wandb_project="egfr-binder-rd2",
+        wandb_entity="anaka_personal",
         transform_type="standardize",
         make_negative=False,
+        seed=117,
+        use_ensemble=True,
+        num_heads=10,
+        dropout=0.15,
+        explore_weight=0.2,
+        max_epochs=10,
     )
-    
     
 
 @app.function(
@@ -655,6 +670,18 @@ def main():
             make_negative=False,
             transform_type="standardize",
         ),
+        PartialEnsembleExpertConfig(
+            type=ExpertType.HYDROPATHY,
+            temperature=1.0,
+            make_negative=True,
+            transform_type="standardize",
+        ),
+        PartialEnsembleExpertConfig(
+            type=ExpertType.PLL,
+            temperature=1.0,
+            make_negative=False,
+            transform_type="standardize",
+        ),
     ]
     
     sequences = sample_sequences.remote(
@@ -725,9 +752,35 @@ def train():
         dropout=0.15,
         explore_weight=0.2,
     )
+    train_bt_model.remote(
+        yvar="binder_hydropathy",
+        wandb_project="egfr-binder-rd2",
+        wandb_entity="anaka_personal",
+        transform_type="standardize", 
+        make_negative=True,
+        seed=117,
+        use_ensemble=True,
+        
+        num_heads=3,
+        dropout=0.15,
+        explore_weight=0.,
+    )
+    train_bt_model.remote(
+        yvar="sequence_log_pll",
+        wandb_project="egfr-binder-rd2",
+        wandb_entity="anaka_personal",
+        transform_type="standardize",
+        make_negative=False,
+        seed=117,
+        use_ensemble=True,
+        num_heads=10,
+        dropout=0.15,
+        explore_weight=0.2,
+        max_epochs=10,
+    )
 
 
 @app.local_entrypoint()
 def train_async():
     """Test just the training functionality."""
-    train_experts_async.remote()
+    results = train_experts_async.remote()
