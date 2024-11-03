@@ -380,7 +380,7 @@ def process_sequences_exact(sequences: Optional[List[str]]=None, save_results: b
 def update_exact_pll_metrics():
     """Update metrics CSV with results from exact ESM2 PLL calculations, only processing new sequences."""
     results_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_pll_results_exact']
-    metrics_file = Path(MODAL_VOLUME_PATH) / 'esm2_exact_pll_metrics.csv'
+    metrics_file = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_exact_pll_metrics']
     
     # Create metrics directory if it doesn't exist
     metrics_file.parent.mkdir(parents=True, exist_ok=True)
