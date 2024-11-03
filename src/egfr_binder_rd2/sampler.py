@@ -6,11 +6,14 @@ import torch
 from datetime import datetime
 import numpy as np
 import json
+import os
 from pathlib import Path
 import time
 
 from egfr_binder_rd2.bt import BTEnsemble
-from egfr_binder_rd2 import LOGGING_CONFIG, MODAL_VOLUME_PATH, OUTPUT_DIRS, ExpertType, ExpertConfig, EvolutionMetadata, PartialEnsembleExpertConfig
+from egfr_binder_rd2 import (
+    LOGGING_CONFIG, MODAL_VOLUME_PATH, OUTPUT_DIRS, 
+    ExpertType, ExpertConfig, EvolutionMetadata, PartialEnsembleExpertConfig, DEFAULT_EXPERT_CONFIGS)
 from egfr_binder_rd2.fold import get_a3m_path
 from egfr_binder_rd2.utils import hash_seq
 # Set up logging
@@ -52,7 +55,13 @@ def safe_log_metrics(df: pd.DataFrame, metric_name: str, logger: logging.Logger)
         elif metric_name == 'binder_plddt':
             mean = df['binder_plddt_mean'].mean()
             std = df['binder_plddt_std'].mean()
-            return {'mean': mean, 'std': std}
+            ucb = df['binder_plddt_ucb'].mean()
+            return {'mean': mean, 'std': std, 'ucb': ucb}
+        elif metric_name == 'sequence_log_pll':
+            mean = df['sequence_log_pll'].mean()
+            std = df['sequence_log_pll_std'].mean()
+            ucb = df['sequence_log_pll_ucb'].mean()
+            return {'mean': mean, 'std': std, 'ucb': ucb}
         else:
             mean = df[metric_name].mean()
             std = df[metric_name].std() if f'{metric_name}_std' in df else None
@@ -112,48 +121,31 @@ class DirectedEvolution:
     @modal.method()
     def run_evolution_cycle(
         self,
-        parent_binder_seqs: List[str],      # List of initial parent sequences to evolve from
-        generations: int = 5,                # Number of evolution cycles to run
-        n_to_fold: int = 50,                # Total number of sequences to fold per generation
-        num_parents: int = 5,               # Number of parent sequences to keep for next generation
-        top_k: int = 10,                    # Number of top sequences to consider for parent selection
-        n_parallel_chains: int = 32,         # Number of parallel MCMC chains per sequence
-        n_serial_chains: int = 1,           # Number of sequential runs per sequence
-        n_steps: int = 250,                 # Number of steps per chain
-        max_mutations: int = -1,             # Maximum number of mutations allowed per sequence
-        evoprotgrad_top_fraction: float = 0.2,    # Fraction of top sequences to consider from EvoProtGrad output
-        parent_selection_temperature: float = 2.0, # Temperature for parent selection (higher = more diversity)
-        temp_cycle_period: int = 5,  # New parameter for cycle period
-        min_sampling_temp: float = 0.5,  # New parameter for min temp
-        max_sampling_temp: float = 2.0,  # New parameter for max temp
-        retrain_frequency: int = 5,         # How often to retrain experts (every N generations)
-        seed: int = 42,                     # Random seed for reproducibility
-        select_from_current_gen_only: bool = False,  # New parameter
+        parent_binder_seqs: List[str],
+        generations: int = 5,
+        n_to_fold: int = 10,
+        num_parents: int = 5,
+        top_k: int = 10,
+        n_parallel_chains: int = 32,
+        n_serial_chains: int = 1,
+        n_steps: int = 250,
+        max_mutations: int = -1,
+        evoprotgrad_top_fraction: float = 0.2,
+        parent_selection_temperature: float = 2.0,
+        temp_cycle_period: int = 5,
+        min_sampling_temp: float = 0.5,
+        max_sampling_temp: float = 2.0,
+        retrain_frequency: int = 5,
+        seed: int = 42,
+        select_from_current_gen_only: bool = False,
+        expert_configs: Optional[List[ExpertConfig]] = None,
     ):
-        """Run multiple cycles of directed evolution with multiple parent sequences.
-        
-        Args:
-            parent_binder_seqs: List of initial parent sequences to evolve from
-            generations: Number of evolution cycles to run
-            n_to_fold: Total number of sequences to fold per generation
-            num_parents: Number of parent sequences to retain for next generation
-            top_k: Number of top sequences to consider for parent selection
-            n_parallel_chains: Number of parallel MCMC chains per sequence
-            n_serial_chains: Number of sequential runs per sequence
-            n_steps: Number of steps per chain
-            max_mutations: Maximum number of mutations allowed per sequence
-            evoprotgrad_top_fraction: Fraction of top sequences to consider from EvoProtGrad output
-            parent_selection_temperature: Temperature parameter for parent selection (higher = more diversity)
-            temp_cycle_period: Number of generations per cycle
-            min_sampling_temp: Minimum temperature value
-            max_sampling_temp: Maximum temperature value
-            retrain_frequency: How often to retrain experts (every N generations)
-            seed: Random seed for reproducibility
-            select_from_current_gen_only: If True, select top_k sequences only from current generation.
-                If False, select from all sequences ever evaluated.
-        """
+        """Run multiple cycles of directed evolution with multiple parent sequences."""
+        # Use default expert configs if none provided
+        if expert_configs is None:
+            expert_configs = DEFAULT_EXPERT_CONFIGS
+
         current_parent_seqs = parent_binder_seqs.copy()
-        expert_configs = None
         all_final_sequences = []
         
         # Create metadata tracker
@@ -176,31 +168,6 @@ class DirectedEvolution:
         }
         metadata = EvolutionMetadata.create(config, parent_binder_seqs)
         
-        expert_configs = [
-            ExpertConfig(
-                type=ExpertType.ESM, 
-                temperature=1.0,
-            ),
-            PartialEnsembleExpertConfig(
-                type=ExpertType.iPAE,
-                temperature=1.0,
-                make_negative=True,
-                transform_type="standardize",
-            ),
-            PartialEnsembleExpertConfig(
-                type=ExpertType.iPTM,
-                temperature=1.0,
-                make_negative=False,
-                transform_type="standardize",
-            ),
-            PartialEnsembleExpertConfig(
-                type=ExpertType.pLDDT,
-                temperature=1.0,
-                make_negative=False,
-                transform_type="standardize",
-            ),
-        ]
-        
         for gen in range(1, generations + 1):
             logger.info(f"=== Generation {gen} ===")
             logger.info(f"Number of parent sequences: {len(current_parent_seqs)}")
@@ -209,7 +176,7 @@ class DirectedEvolution:
             if self.should_retrain(gen, retrain_frequency):
                 logger.info(f"Generation {gen}: Starting expert retraining in background...")
                 # Fire and forget - don't store or wait for the future
-                _ = self.train_experts.remote.aio()
+                _ = self.train_experts.spawn()
                 logger.info("Expert retraining started asynchronously")
             
             # Calculate sequences to sample per parent
@@ -242,8 +209,8 @@ class DirectedEvolution:
 
             evoprotgrad_df['i_ptm_ucb_rank'] = evoprotgrad_df['i_ptm_ucb'].rank(pct=True)
             evoprotgrad_df['pae_interaction_ucb_rank'] = evoprotgrad_df['pae_interaction_ucb'].rank(pct=True)
-            evoprotgrad_df['sequence_log_pll_rank'] = evoprotgrad_df['sequence_log_pll'].rank(pct=True)
-            evoprotgrad_df['fitness_ucb'] = (evoprotgrad_df['i_ptm_ucb'] + evoprotgrad_df['pae_interaction_ucb'] + evoprotgrad_df['sequence_log_pll_rank']) / 3
+            evoprotgrad_df['sequence_log_pll_ucb_rank'] = evoprotgrad_df['sequence_log_pll_ucb'].rank(pct=True)
+            evoprotgrad_df['fitness_ucb'] = (evoprotgrad_df['i_ptm_ucb_rank'] + evoprotgrad_df['pae_interaction_ucb_rank'] + evoprotgrad_df['sequence_log_pll_ucb_rank']) / 3
             evoprotgrad_df = evoprotgrad_df.sort_values('fitness_ucb', ascending=False).reset_index(drop=True)
 
             # Sample sequences from the top fraction, now considering parent information
@@ -278,7 +245,7 @@ class DirectedEvolution:
                 pae_metrics = safe_log_metrics(selected_variants_df, 'pae_interaction', logger)
                 ptm_metrics = safe_log_metrics(selected_variants_df, 'i_ptm', logger)
                 plddt_metrics = safe_log_metrics(selected_variants_df, 'binder_plddt', logger)
-                pll_metrics = safe_log_metrics(selected_variants_df, 'sequence_log_pll', logger)
+                pll_metrics = safe_log_metrics(selected_variants_df, 'sequence_log_pll_ucb', logger)
 
                 if pae_metrics['mean'] is not None:
                     logger.info(f"iPAE (mean ± std): {pae_metrics['mean']:.2f} ± {pae_metrics['std']:.2f}")
@@ -300,7 +267,7 @@ class DirectedEvolution:
                     f"bt iPAE={row['pae_interaction_mean']:.2f} (UCB={row['pae_interaction_ucb']:.2f}), "
                     f"bt iPTM={row['i_ptm_mean']:.2f} (UCB={row['i_ptm_ucb']:.2f}), "
                     f"bt pLDDT={row['binder_plddt_mean']:.2f}, "
-                    f"PLL={row['sequence_log_pll']:.2f} "
+                    f"bt PLL={row['sequence_log_pll_ucb']:.2f} "
                     f"Sequence={row['sequence']} "
                 )
 
@@ -310,26 +277,26 @@ class DirectedEvolution:
             selected_variants_df.to_csv(output_path, index=False)
             logger.info(f"Saved selected variants metrics to {output_path}")
 
-            # Save PLL values in ESM2 format
-            results_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_pll_results']
-            results_dir.mkdir(parents=True, exist_ok=True)
+            # # Save PLL values in ESM2 format
+            # results_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS['esm2_pll_results']
+            # results_dir.mkdir(parents=True, exist_ok=True)
 
-            for _, row in selected_variants_df.iterrows():
-                seq = row['sequence']
-                seq_hash = f"bdr_{hash_seq(seq)}"
-                result = {
-                    "sequence": seq,
-                    "sequence_hash": seq_hash,
-                    "sequence_log_pll": row['sequence_log_pll'],
-                    "normalized_log_pll": row['sequence_log_pll'] / len(seq),  # Approximate normalization
-                    "sequence_length": len(seq)
-                }
+            # for _, row in selected_variants_df.iterrows():
+            #     seq = row['sequence']
+            #     seq_hash = f"bdr_{hash_seq(seq)}"
+            #     result = {
+            #         "sequence": seq,
+            #         "sequence_hash": seq_hash,
+            #         "sequence_log_pll": row['sequence_log_pll'],
+            #         "normalized_log_pll": row['sequence_log_pll'] / len(seq),  # Approximate normalization
+            #         "sequence_length": len(seq)
+            #     }
                 
-                result_path = results_dir / f"{seq_hash}.json"
-                with open(result_path, 'w') as f:
-                    json.dump(result, f, indent=2)
+            #     result_path = results_dir / f"{seq_hash}.json"
+            #     with open(result_path, 'w') as f:
+            #         json.dump(result, f, indent=2)
 
-            logger.info(f"Saved {len(selected_variants_df)} PLL results in ESM2 format")
+            # logger.info(f"Saved {len(selected_variants_df)} PLL results in ESM2 format")
 
             
             
@@ -360,9 +327,9 @@ class DirectedEvolution:
             volume.reload()
             
 
-            # Get PLL metrics
-            # logger.info(f"Processing sequences to obtain PLL metrics...")
-            # self.process_sequences.remote()
+            #Get PLL metrics
+            logger.info(f"Processing sequences to obtain PLL metrics...")
+            self.process_sequences.remote(variant_seqs)
             
             
             volume.reload()
@@ -686,6 +653,8 @@ class DirectedEvolution:
                 } for _, row in top_sequences.iterrows()]
             }
             metadata.add_generation(gen, gen_metrics)
+            os.makedirs(MODAL_VOLUME_PATH /OUTPUT_DIRS["evolution_trajectories"], exist_ok=True)
+            metadata.save(MODAL_VOLUME_PATH /OUTPUT_DIRS["evolution_trajectories"])
 
         logger.info("Directed evolution cycle completed.")
         # Save metadata
@@ -833,51 +802,148 @@ def main():
     #     # 'SSFSACPSSYDGICSNGGVCRYIQTLTSYTCQCPPGYTGDRCQTFDIRLLELRG',
     #     'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELR',
     # ] * 10
-    parent_binder_seqs = [
-        # 'SYDGYCLNGCIGYSGDRCQTRDLRWWELR',
-        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELR', 
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRR', 
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRR',
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRR',
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRR',
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRR',
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRR',
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRRR',
-        # 'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRRRR',
-    ]
-    parent_binder_seqs = [
-        'SYDGYCLNKGVCHHIESLDSYTCQCVIGYSGDRCQTRDLRFLELQ'
-    ]
-    parent_binder_seqs = [
-        'AERMRRRFESIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
-         
-    ]
-    parent_binder_seqs = [
-        'SLFSRCPRRYHGICGNNGLCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLRN',
-        'GLFSICPRRYQGICKNNGTCRYALNLRTYTCQCVSGYTGARCQELDIRYLLLRY',
-        'SLFSACPSRYHGICKNNGVCRYAISLRSSTCHCVSGYTGYRCQELDIIHLLLRY',
-        'SLFSICPRRYHGICGNNGLCRYAINLRTYTCRCVSGYTGIRCQELDIRYLLLRS',
-        'SLFSACPSRYHGICKNNGQCRYAISLRSSTCHCVSGYTGYRCQELDIIHLLLRY',
-        'SLFSICPRRYRGICKNNGSCRYALNLRTYTCQCVSGYTGARCQELDIRYLLLRS',
-        'SLFSACPSKFHGICNNNGVCRYAINLRSYTCICLEGYTGDRCQELDIRYLLLRL',
-        'SLFSACPSKFHGICNNNGVCRYAINLRSYTCICLEGYTGDRCQELDIRHLLLRL',
-        'SLFSACPSKFHGICNNNGVCRYAISLRSYTCICLEGYTGPRCQELDIRHLLLRL',
-        'SLFSACPSRYHGICKNNGVCRYAINLRSYTCHCVSGYTGDRCQELDIRFLLLRY'
-    ]
     
+    # parent_binder_seqs = [
+    #     'SYDGYCLNKGVCHHIESLDSYTCQCVIGYSGDRCQTRDLRFLELQ'
+    # ]
+    # parent_binder_seqs = [
+    #     'AERMRRRFESIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
+         
+    # ]
+    # parent_binder_seqs = [
+    #     'SLFSRCPRRYHGICGNNGQCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLLN',
+    #     'SLFSKCPSKFHGICNNNGVCRYAINLRSYTCICLEGYTGDRCQEIDIRYLLLQL',
+    #     'SLFSACPYRYHGICKNNGQCRYAISLRSGTCHCVSGYTGYRCQEIDIRYLLLRY',
+    #     'SLFSKCPRRYHGICGNNGLCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLLN',
+    #     'SLFSRCPRRYHGICGNNGLCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLRN',
+    #     'NLFSICPRRYRGICKNNGSCRYAINLRTYTCQCVSGYTGARCQELDIRYLLLRY',
+    #     'SLFSACPSRYHGICKNNGQCRYAISLRSGTCHCVSGYTGYRCQEIDIRYLLLRY',
+    #     'GLFSICPRRYQGICKNNGTCRYALNLRTYTCQCVSGYTGARCQELDIRYLLLRY',
+    #     'GLFSICPRRYQGICKNNGTCRYALNLRTYTCQCVSGYTGARCQELDIRYLLLLY',
+    #     'SLFSKCPSKFHGICNNNGVCRYAINLRSYTCICLEGYTGDRCQELDIRHLLLRL'
+    # ]
+    parent_binder_seqs = [
+        'SYDGYCLNGCIGYSGDRCQTRDLRWWELR',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELR', 
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRR', 
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRR',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRR',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRR',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRR',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRR',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRRR',
+        'SYDGYCLNGGVCMHIESLDSYTCNCVIGYSGDRCQTRDLRWWELRRRRRRRRR',
+    ]
+    parent_binder_seqs = [
+        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
+        'NLFSNCPRRYRGICENNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
+        'SLFSRCPKRYHGICNNNGQCRYAINLRTYTCICKSGYTGDRCQELDIRYLLLLN',
+        'SLFSRCPRRYHGICGNNGQCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLLN',
+        'NLFSNCPRRYRGICNNNGSCQYAINLRTYTCQCSSGYTGARCQELDIRYLLLLY',
+        'GLFSRCPKRYHGICGNNGQCRYAINLRTYTCRCVSGYTGPRCQELDIRYLLLLN',
+        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCSSGYTGARCQELDIRYLLLLY',
+        'NLFSRCPKRYHGICENNGQCRYAINLRTYTCICDSGYTGDRCQELDIRYLLLLN',
+        'SLFSRCPRRYHGICHNNGQCRYAINLRTYTCRCVSGYTGDRCQEKDIRYLLLLY',
+        'NLFSICPRRYRGICTNNGSCRYAINLRTYTCQCVSGYTGARCQELDIRYLLLLY',
+        'SLFSRCPKRYHGICNNNGQCRYAINLRTYTCICVSGYTGDRCQELDIRYLLLLN',
+        'GLFSRCPKRYHGICGNNGQCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLLN',
+        'SLFSRCPYRYHGICNNNGQCRYAINLRTYTCICVSGYTGDRCQELDIRYLLLLN',
+        'ELFSRCPKRYHGICGNNGQCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLLN',
+        'NLFSRCPKRYHGICGNNGQCRYAIHLRTGTCRCVSGYTGRRCQELDIRYLLLLY',
+        'SLFSRCPRRYYGICGNNGLCKYAINLRTGTCRCVSGYTGDRCQELDIRYLLLLN',
+        'NLFSKCPRRYYGICGNNGRCKYAINLRTYTCRCVSGYTGQRCQEKDIRYLLLLN',
+        'GLFSRCPKRYHGICGNNGQCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLRLN',
+        'SLFSKCPSKFHGICNNNGVCRYAINLRSYTCICLEGYTGDRCQEIDIRYLLLQL',
+        'SLFSACPYRYHGICKNNGQCRYAISLRSGTCHCVSGYSGYRCHEIDIRYLLLRY'
+    ]
+    parent_binder_seqs = [
+        'AERMRRRFEHIVKIHEEWAKEVLENLKKQGSSEEDLKFMEEYLKQDVEELRERAEKMVEEYRKSS',
+        # 'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
+        'SHMVEEALEIVKKLKEAGSDMKKIDELIEKLKEVFEKMPLEDVWPVLYEAEKAAFELMWNAEEGEEDVARAGNYLITKVWDLYFWLREREAARNAAAM',
+        'SKEEEYYEEHQKLAKPVEELWEKLDELEKTGKLTGEHRPLVTEFRRLWSDAMVLIAMYMWYLEEVDKNPSEENRKKAQEYLEKVEEKKKEMEELLKKL',
+        'SMEKEKLLEIVKELKEAGSDMEKIDELIEKMWEVMKKMELKDIWPVLYELEKVAFELMWNAEEGEEEVARAGNYLITKAWDLYFKAREAEAARNAALM',
+        'SSSLVPKAKEEAEDKIIEKIFEVQALSYIHVGETGDRKRHEEIHKKMHEIWEELQKFKKDPSVKTVEEVEKFEKELLEKLEKLKKSL',
+        'PVVPEPTMEDFEREFWELYAEYSKAYAEGTEEGLKKTRELRKKIMDVIGRQLEYIWNM',
+        'SLDDEITEKLREIVELSDEYALLHWRAKKLSGEEKKEVEEKMKEIKKKIDELWEEVGKLFDESMEKDEAAGKE',
+        # 'SLDDEITEKLREIVELSDEYALLHWRAKKLTGKEKEEVLKKMEEIKKRIDELWEEVGKLFDESMAKDEAAGKE',
+        'MPVPTPTMEDFEREFWKLYAEYSKAYAEGTEEGLAKTRELRKQIMDVIGRQLEYIWNM',
+        'MESIHEIVDKAAYEVIQTFIEKGASDEAKEEQTKIWDEAMAKINAIRAAA',
+        'APPLSEIEKEGQKVIAEIEKALTPVPEYHNRLTWENYQKAFVLEMEFFEKFPTEEAATVMSDFWSKFMKP',
+        'SMAEQKAEQEAKLAVWEAEMQADTDRMIADVMHRATPENAAEAQEVVDFLRLTRDEIIARRREIIEKKLAE',
+        # 'SMEEIRKEQKEKLEVWKKEMEKDTEKMINDVMHRATEENKEEAEEVVNFLRLTREEIIKRREEIIEKKLKE',
+        # 'SSLDEWLASLDPQVGQDIRDYIEERQAE',
+        'SSLDEWLASLDPQVGADIRAYIEERQAE',
+        'SEEKLAEIEAKLKEAAETLNVYEFFEVYSQIVVTTVLTREEYRRVDALSDKYFKKAPKRS',
+        # 'SEELLKEIEKKLKEAAKTLDVYEFFEVYSQIVVTTVLTREEYRRVDEISDKYFKEAPERS',
+        'MESIHEIVDKTAYEVIQTFIELGASEEAKEKQTKLWDEAMKKINEIRAKE',
+        'SEEELREQLREAVRPYIEDISQPMLEAIEALKREGDTELAEVMRKDEEEQIEKWTEMYVDILMKQL',
+        # 'TIREHHARQWARYQLEWLRDLVRDENLTDVDPEVLALIESDFTETVPAEELEAVIDELFKAVMDVIDKK',
+        # 'MKELKETIEKVRKEVEEMEKKVEEVIKDKSKLEEMMHELFYKASEAQFRVEMAKWRLVKQYGESVKEEVEEAEKVIEEVDEAFRKWWEKLESKM',
+        # 'EKEKVPKALEEAEDKIIEKIFEVQALSYIHVGETGDRELHEKIHEEMHEIWEELQKKKKDESIKTVEEVEKFEEELLKKLEELKESL',
+        # 'SMIKEEIEKVKKEWEEAKKKGVEGMMWVSFFNADWLLMYLKWKLKKRPELEPELKPLIEELEKLIKEIKEEIESL',
+        # 'MKIELSEEERQIVRDYVAKHAPWVSEKAIEAAIDAVLNAENFEEHQKYKEEAVKNGVDEDEFEVGMIVADPAVRWMAHPDPEMRQHYLHVFTP',
+        # 'MEELRKVMEEVKEEVKRLKEKVEEVIKDKEKLEEMMHELFYTASENQFRVEMAKWRLKKQYGESVKEEEEEAEKVIKEVDETFREYWEKLEKLM',
+        # 'PPVPEPFTEYRRWMRKLYEALDKYKYYEAKGDEKKAAEAKKEFEEVVANPPASMTDENVKAVVEEITAWQDVLGEAYKAAFTEE',
+        # 'MLSIDEILERMEEAVIRWAEEHPEKRHEMLKVAYSMRFMLRILYDENNGDLEKTFEEVEKIYAPKSEVAQEVLEVMREAIK',
+        # 'SAAEVHHLKRSKEYHLHFSNTVIDHMKKDGHTEDAKEMEAIKEKYLEEQEKKIKEAE',
+        # 'MLSIDELLEKMEEAVIKWAEEHPEVRHEALKTMYSIRFMFRIKYDENNGDFEKTFEEIKKIYEPKSEVAKEVLKVIEEAIK',
+        # 'SMEEFMKEWAKLQIEWYAEKAKGLPEGKKKHIFEITEQDLIWIARDLPELQEEIKKWVKEAEEK',
+        # 'EKEKELEKDYEDLKKVLWTGIEYEVRDEAYIEGRPDLPEEELKKRVEERVEKRVEEIRSMS',
+        # 'MRPKEVEELVPMYEKLLEKYKDDPWIVREIQADYYFHEAFIEYQVENGKEEEARRALEMFKKWVKEKYGEEFVE',
+        # 'MVPEEVLELRPVYEKLLEKYKDDPWIVREIQADYYFHEAFIEYQYENGKPEEARRALEMFKEWVRERYGEEFVP',
+        # 'MKIKLSEEEKQIVRDYVAKHAPWVSEKAIEAAIEAVLNAENFEEHQEFKKKAVEEGVDEDEFEVGMIVADPAVRWMAHPDPEMRQHYLHVFTP',
+        # 'MSPIEKEVLKDIEGAKEAIEKAKTTKDWEERFFMVYKMWSRLSYYRNDPEIMESLPEELQKKVEEEYERAYKEIWDISYQHIMDVVENG',
+        # 'MLSDREIMLEGLKMALEIFAPYMMQEYIEKIKEVVEEGIELVVKGVSFEEAREKAIEKVRNLPGVDEDTKIHLSFWVDSLLRYVYWYYQHYKR',
+        # 'MMSVEEWFERFKDPSADKEKVKAELEEAVKNKELSLNEVYELSVRIHMELYPRHKEYGLTKEEVRELFWFVNDLFFDMLIEGWTFEFK',
+        # 'SSEVEKLKEEFEEFLKEMEKYHHGDRETMEEALKRAEELAKRATELFQEAQKNNASDQDIHTLFYISTQMEHYAQWFKHML',
+        # 'MSEEQKKVLEYIEGAKKAIEEAKTIPNWEERFFLVYKMWSRLSYVRNNKELMESLPEELQKKVEEEYEKAYKEIWDISYQHIMDVVKNG',
+        # 'SLVDEYRAHMTEEEKKIFDRIVELLSKAFGKSKEEVEEFLVSLIPLMDNVGEQDKIAKGLLEKLTSAGALSEDEFWDLYYELQAVLLDVDRRMHRP',
+        # 'SMAEVHHLERSKEYHLHFSDTVIEHMRKDGHYEDAEEMEKIKKKYEEEMDKKIEEAK',
+        # 'SIQEKYDRLEKLHRDFMWKHHPSPNGPKEVLKMMKSEETKELYKKYYELWQRIENLFWKVLIEGEKVLDEAVPEMEKLIKEASEIKKKVEELYKKELEE',
+        # 'SMDELIEKVIEKYNITDEDEIWELRAWATPGFVRFVKEMAHERGKEKFLEEFKKTSRSKVEVMLVEEIVKQVP',
+        # 'SKEEEEKLIEFMKEFLKKLAEEEKAKLEAAGDKVTMREVFAIYWYRMFERALEELRKRGSTQYRYVLHKKFEEIVDEMIKEAE',
+        # 'RFSEEELELLERLAPEIPEVAEARERLERGEPIPAELLKKIAEALYNLPDSTKFTPEEHRELWRLYSNVVMDWHIAEADTPP',
+        # 'RFSEEELELLERLAPEIPEVAEMRRRMERGEPIPPELLKKIADALYNLPDSTKFTPEEHRELWRLYSNVVMDWHIAEADTPK',
+        # 'MPMSDEEKAKKMHIMIQHYYYEVQFMAWVLGLSKDSPEYKELMEPLKKMEELWEKFFEKGADTDKIYEEIKKVYEEGMAKANAFWEEKFNPK',
+        # 'MTVEEFVEKMMELYEHRYSTPSEIEAFRYHVMGVADIIYHHNNGKVPTIEEVERVLGLPPATPP',
+        # 'SAEEEREKQLKLLEEFKKEANELSVEFEKVMVDKHKETGKISQTEYQKKMSEFYDKIFTLHVEFAELLHNGAPEEEVLKFKEEALAELKQMVEDFKKE'
+    ]
+    parent_binder_seqs = [
+        'AERMRRRFEHIVKIHEEWAKEVLENLKKQGSSEEDLKFMEEYLKQDVEELRERAEKMVEEYRKSS',
+        'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
+    ]
+    parent_binder_seqs = [
+        'LFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
+        'FSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
+        'SNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
+        'NCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
+        'CPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
+        'PRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
+        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLL',
+        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLL',
+        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLL',
+        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYL',
+        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRY',
+        'LFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLL',
+        'FSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLL',
+        'SNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLL',
+        'NCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYL',
+        'CPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRY',
+        'PRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIR',
+    ]
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
-        generations=80,
+        generations=30,
         n_to_fold=50,                # Total sequences to fold per generation
         num_parents=10,               # Number of parents to keep
         top_k=200,                    # Top sequences to consider
-        n_parallel_chains=16,        # Parallel chains per sequence
+        n_parallel_chains=10,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
         n_steps=50,                  # Steps per chain
         max_mutations=5,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.25,
-        parent_selection_temperature=0.5,
+        parent_selection_temperature=0.3,
         temp_cycle_period=5,  # Complete cycle every 5 generations
         min_sampling_temp=0.3,  # Minimum temperature value
         max_sampling_temp=2.0,  # Maximum temperature value
