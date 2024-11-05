@@ -1162,3 +1162,9 @@ def fhq(s: str):
     """Fold a high quality binder sequence."""
     result = fold_binder_high_quality.remote(s)
     print(f"Folded high quality sequence: {result}")
+
+@app.local_entrypoint()
+def msa_for_binder(s:str):
+    """Get MSA for a binder sequence."""
+    result = get_msa_for_binder.remote([s])
+    print(f"MSA for binder sequence: {result}")

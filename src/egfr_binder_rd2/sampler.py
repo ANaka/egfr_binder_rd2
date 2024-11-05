@@ -1029,25 +1029,36 @@ def main():
     ]
     parent_binder_seqs = [
         # 'NSDSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWELRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRNSDSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWELR'
-        'NSDSECPLSHDGYCLHDGVCMYIEALDKYACTCPVGYIGERCQYRDLKWWELHGGEGGEGGEGGEGGEGGPGGEGGRGGEGGRGGEGGRGGEGGERGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRCGEGGEGGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRNSDSECPLSHDGYCLHDGVCMYIEALTKYACNCPVGYIGERCQYRDLKWWELR',
+        # 'NSDSECPLSHDGYCLHDGVCMYIEALDKYACTCPVGYIGERCQYRDLKWWELHGGEGGEGGEGGEGGEGGPGGEGGRGGEGGRGGEGGRGGEGGERGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRCGEGGEGGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRNSDSECPLSHDGYCLHDGVCMYIEALTKYACNCPVGYIGERCQYRDLKWWELR',
+        # 'SYEGYCLNGGTLVHVESLDSYTCGCLKGYTGDRCQSQDLRYLYLE',
+    ]
+    parent_binder_seqs = [
+        
+        'SYDGYCLNGGVCMHIESC',
+        'ESGDYYQTRDLRWWELR',
+        'ESGDYYQTRDLRWWERRM',
+        'SYDGYCLNGGVCMHIES',
+        'RPEDYYQTRTTRWAELD',
+        'ESDDYYQTRDNRTWELR',
+        'DHHDIAQTRDLRHHELI',
     ]
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
         generations=20,
-        n_to_fold=25,                # Total sequences to fold per generation
-        num_parents=5,               # Number of parents to keep
+        n_to_fold=50,                # Total sequences to fold per generation
+        num_parents=10,               # Number of parents to keep
         top_k=200,                    # Top sequences to consider
         n_parallel_chains=32,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
         n_steps=50,                  # Steps per chain
-        max_mutations=20,             # Max mutations per sequence
+        max_mutations=3,             # Max mutations per sequence
         evoprotgrad_top_fraction=0.4,
         parent_selection_temperature=0.3,
         temp_cycle_period=5,  # Complete cycle every 5 generations
         min_sampling_temp=0.1,  # Minimum temperature value
         max_sampling_temp=1.,  # Maximum temperature value
-        retrain_frequency=2,
+        retrain_frequency=1,
         seed=42,
         select_from_current_gen_only=True,  # Add this parameter
         include_solubility=True,  # New parameter
@@ -1060,7 +1071,7 @@ def main():
             # ),
             PartialEnsembleExpertConfig(
                 type=ExpertType.iPAE,
-                temperature=1,
+                temperature=5,
                 make_negative=True,
                 transform_type="standardize",
                 num_heads=10,
@@ -1070,7 +1081,7 @@ def main():
             ),
             PartialEnsembleExpertConfig(
                 type=ExpertType.iPTM,
-                temperature=10,
+                temperature=5,
                 make_negative=False,
                 transform_type="standardize",
                 num_heads=10,
@@ -1088,16 +1099,16 @@ def main():
             #     explore_weight=0.2,
             #     loss_type='bt',  # Add explicit loss type
             # ),
-            PartialEnsembleExpertConfig(
-                type=ExpertType.p_soluble,
-                temperature=1,
-                make_negative=False,
-                transform_type="standardize",
-                num_heads=3,
-                dropout=0.15,
-                explore_weight=0.,
-                loss_type='bt',  # Add explicit loss type
-            ),
+            # PartialEnsembleExpertConfig(
+            #     type=ExpertType.p_soluble,
+            #     temperature=1,
+            #     make_negative=False,
+            #     transform_type="standardize",
+            #     num_heads=3,
+            #     dropout=0.15,
+            #     explore_weight=0.,
+            #     loss_type='bt',  # Add explicit loss type
+            # ),
             PartialEnsembleExpertConfig(
                 type=ExpertType.PLL,
                 temperature=1,

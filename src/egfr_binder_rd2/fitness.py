@@ -55,6 +55,6 @@ def get_exact_fitness():
     exact['fitness'] = exact['sequence_log_pll'] + exact['pae_interaction']
     exact['i_ptm_rank'] = exact['i_ptm'].rank(ascending=True, pct=True)
     exact['sequence_log_pll_rank'] = exact['sequence_log_pll'].rank(ascending=True, pct=True)
-    exact['pae_interaction_rank'] = exact['pae_interaction'].rank(ascending=True, pct=True)
+    exact['pae_interaction_rank'] = exact['pae_interaction'].rank(ascending=False, pct=True)
     exact['fitness'] = (exact['i_ptm_rank'] + exact['sequence_log_pll_rank'] + exact['pae_interaction_rank']) / 3
     return exact.sort_values('fitness', ascending=False).reset_index(drop=True)
