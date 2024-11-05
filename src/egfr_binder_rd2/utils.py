@@ -1,7 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
-from egfr_binder_rd2 import  OUTPUT_DIRS
+from egfr_binder_rd2 import  OUTPUT_DIRS, MODAL_VOLUME_PATH
 from egfr_binder_rd2 import EvolutionMetadata
 
 def hash_seq(sequence):
@@ -152,5 +152,9 @@ def load_evolution_metadata(metadata_file: Path) -> EvolutionMetadata:
     with open(metadata_file, "r") as f:
         data = json.load(f)
     return EvolutionMetadata(**data)
+
+def get_expression_model_path() -> Path:
+    """Get path to saved expression model"""
+    return Path(MODAL_VOLUME_PATH) / "expression_model.pt"
 
 

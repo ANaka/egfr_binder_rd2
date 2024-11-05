@@ -15,6 +15,7 @@ from egfr_binder_rd2.utils import hash_seq
 from typing import List, Dict, Optional
 import numpy as np
 from dataclasses import dataclass
+from egfr_binder_rd2.fold import HYDROPHOBICITY_INDICES
 # from esm.modules import TransformerLayer
 # Utility functions
 def create_pairwise_comparisons(batch, outputs, label):
@@ -359,8 +360,8 @@ class PartialEnsembleHead(nn.Module):
 class PartialEnsembleModule(pl.LightningModule):
     def __init__(
         self,
-        label: str,  # Changed from labels to label since all heads predict same target
-        num_heads: int = 5,  # Number of ensemble heads
+        label: str,
+        num_heads: int = 5,
         model_name: str = "facebook/esm2_t33_650M_UR50D",
         lr: float = 5e-4,
         peft_r: int = 8,
@@ -369,20 +370,21 @@ class PartialEnsembleModule(pl.LightningModule):
         xvar: str = 'binder_sequence',
         dropout: float = 0.1,
         explore_weight: float = 0.2,
+        loss_type: str = 'bt',
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        
-        
         self.label = label
         self.max_length = max_length
         self.explore_weight = explore_weight
+        self.loss_type = loss_type.lower()
+        
         # Initialize base components
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.esm_model = self._initialize_model(model_name, peft_r, peft_alpha)
         
-        # Create multiple independent heads predicting the same target
+        # Create multiple independent heads
         config = self.esm_model.config
         self.ensemble_heads = nn.ModuleList([
             PartialEnsembleHead(
@@ -399,8 +401,10 @@ class PartialEnsembleModule(pl.LightningModule):
         self.val_mae = MeanAbsoluteError()
         self.val_spearman = SpearmanCorrCoef()
 
-        # Add Bradley-Terry loss
+        # Initialize losses
         self.bt_loss = BradleyTerryLoss()
+        self.mse_loss = nn.MSELoss()
+        self.xvar = xvar
 
     def _initialize_model(self, model_name, peft_r, peft_alpha):
         base_model = EsmModel.from_pretrained(
@@ -438,12 +442,20 @@ class PartialEnsembleModule(pl.LightningModule):
 
     def _compute_loss(self, head_predictions, targets):
         # Ensure targets have the same shape as predictions
-        targets = targets.view(-1, 1)  # reshape to [batch_size, 1]
+        targets = targets.view(-1, 1)
         
+        if self.loss_type == 'bt':
+            return self._compute_bt_loss(head_predictions, targets)
+        elif self.loss_type == 'mse':
+            return self._compute_mse_loss(head_predictions, targets)
+        else:
+            raise ValueError(f"Unsupported loss type: {self.loss_type}")
+
+    def _compute_bt_loss(self, head_predictions, targets):
         # Compute BT loss for each head independently
         losses = []
         for i in range(head_predictions.shape[1]):  # For each head
-            head_pred = head_predictions[:, i].view(-1, 1)  # reshape to [batch_size, 1]
+            head_pred = head_predictions[:, i].view(-1, 1)
             scores_i, scores_j, y_ij = create_pairwise_comparisons(
                 {"predictions": head_pred, self.label: targets},
                 head_pred,
@@ -456,7 +468,17 @@ class PartialEnsembleModule(pl.LightningModule):
         # Return mean loss across heads if we have any valid comparisons
         if losses:
             return torch.stack(losses).mean()
-        return torch.tensor(0.0, device=self.device, requires_grad=True)  # Add requires_grad=True
+        return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    def _compute_mse_loss(self, head_predictions, targets):
+        # Compute MSE loss for each head independently
+        losses = []
+        for i in range(head_predictions.shape[1]):
+            head_pred = head_predictions[:, i].view(-1, 1)
+            head_loss = self.mse_loss(head_pred, targets)
+            losses.append(head_loss)
+        
+        return torch.stack(losses).mean()
 
     def training_step(self, batch, batch_idx):
         batch = self(batch)
@@ -497,7 +519,7 @@ class PartialEnsembleModule(pl.LightningModule):
             'predictions': outputs['predictions'].view(-1),  # Changed from squeeze()
             'uncertainties': outputs['uncertainties'].view(-1),  # Changed from squeeze()
             'head_predictions': outputs['head_predictions'],  # Remove squeeze()
-            'sequence': batch[self.hparams.xvar],
+            'sequence': batch[self.xvar],
             'target': batch[self.label],
         }
 
@@ -505,21 +527,19 @@ class PartialEnsembleModule(pl.LightningModule):
         """Save both PEFT adapter, ensemble heads, and pooler state"""
         adapter_state_dict = get_peft_model_state_dict(self.esm_model)
         ensemble_state_dict = self.ensemble_heads.state_dict()
-        pooler_state_dict = self.esm_model.pooler.state_dict()  # Save pooler state
+        pooler_state_dict = self.esm_model.pooler.state_dict()
 
         save_dict = {
             'adapter_state_dict': adapter_state_dict,
             'ensemble_state_dict': ensemble_state_dict,
-            'pooler_state_dict': pooler_state_dict,  # Include pooler state
+            'pooler_state_dict': pooler_state_dict,
             'hparams': dict(self.hparams),
             'model_name': self.hparams.model_name,
         }
 
         torch.save(save_dict, save_path)
         print(f"Model saved to: {save_path}")
-        # print(f"Adapter state dict keys: {list(adapter_state_dict.keys())}")
-        # print(f"Ensemble state dict keys: {list(ensemble_state_dict.keys())}")
-        # print(f"Pooler state dict keys: {list(pooler_state_dict.keys())}")
+        return save_dict
 
     @classmethod
     def load_model(cls, load_path: str):
@@ -563,3 +583,114 @@ class PartialEnsembleModule(pl.LightningModule):
         model = cls.load_model(model_path)
         model.current_run_path = f'{artifact.entity}/{artifact.project}/{artifact.source_name}'
         return model
+
+class PartialEnsembleModuleWithFeatures(PartialEnsembleModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # Get ESM model's output dimension
+        self.esm_output_dim = self.esm_model.config.hidden_size
+        
+        # Project features to a smaller dimension that will be concatenated with ESM output
+        self.feature_projection = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.ReLU(),
+            nn.LayerNorm(32)
+        )
+        
+        # Update ensemble heads to account for additional feature dimensions
+        total_hidden_dim = self.esm_output_dim + 32  # ESM output + projected features
+        self.ensemble_heads = nn.ModuleList([
+            nn.Linear(total_hidden_dim, 1) for _ in range(self.hparams.num_heads)
+        ])
+    
+    def _calculate_sequence_features(self, sequences: List[str]) -> torch.Tensor:
+        """Calculate sequence features directly from sequences"""
+        features = []
+        for seq in sequences:
+            # Clean sequence - remove whitespace and convert to uppercase
+            seq = ''.join(seq.split()).upper()
+            
+            # Skip empty sequences
+            if not seq:
+                features.append([0, 0, 0, 0])  # Default values for empty sequence
+                continue
+                
+            # Calculate solubility using indices from fold.py
+            solubility = sum(HYDROPHOBICITY_INDICES.get(aa, {'solubility': 0})['solubility'] for aa in seq) / len(seq)
+            
+            features.append([
+                len(seq),  # length
+                sum(aa in 'DEKRH' for aa in seq) / len(seq),  # perc_charged
+                sum(aa in 'AILMFWYV' for aa in seq) / len(seq),  # perc_hydrophobic
+                solubility  # average solubility score
+            ])
+        return torch.tensor(features, dtype=torch.float32, device=self.device)
+    
+    def forward(self, batch):
+        # Get sequence input
+        sequence_input = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        
+        # Get sequences from input_ids using tokenizer
+        sequences = self.tokenizer.batch_decode(
+            sequence_input, 
+            skip_special_tokens=True
+        )
+        
+        # Calculate features directly
+        numerical_features = self._calculate_sequence_features(sequences)
+        
+        # Get ESM outputs
+        outputs = self.esm_model(
+            input_ids=sequence_input,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        
+        # Project numerical features
+        projected_features = self.feature_projection(numerical_features)
+        
+        # Combine features
+        combined_features = torch.cat([
+            outputs.pooler_output,
+            projected_features
+        ], dim=1)
+        
+        head_predictions = torch.cat([
+            head(combined_features) for head in self.ensemble_heads
+        ], dim=1)
+        
+        mean_pred = head_predictions.mean(dim=1, keepdim=True)
+        std_pred = head_predictions.std(dim=1, keepdim=True)
+        
+        batch["head_predictions"] = head_predictions
+        batch["predictions"] = mean_pred
+        batch["uncertainties"] = std_pred
+        batch['ucb'] = mean_pred + self.explore_weight * std_pred
+        return batch
+
+    def save_model(self, save_path: str):
+        """Save model including feature projection layer"""
+        save_dict = super().save_model(save_path)
+        save_dict['feature_projection_state'] = self.feature_projection.state_dict()
+        torch.save(save_dict, save_path)
+        return save_dict
+
+    @classmethod
+    def load_model(cls, load_path: str):
+        """Load model including feature projection layer"""
+        model = super().load_model(load_path)
+        saved_dict = torch.load(load_path)
+        model.feature_projection.load_state_dict(saved_dict['feature_projection_state'])
+        return model
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        outputs = self(batch)
+        return {
+            'predictions': outputs['predictions'].view(-1),
+            'uncertainties': outputs['uncertainties'].view(-1),
+            'head_predictions': outputs['head_predictions'],
+            'sequence': batch['sequence'],  # Now using 'sequence' directly
+            'target': batch[self.label],
+        }

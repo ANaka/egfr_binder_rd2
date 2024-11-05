@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 import re
 
-
+from egfr_binder_rd2.solubility import calculate_solubility
 EGFR_EPITOPE_RESIDUES = [11, 12, 13, 15, 16, 17, 18, 356, 440, 441]
 INTERACTION_CUTOFF = 4.0  # Angstroms
 
@@ -138,16 +138,6 @@ class LocalColabFold:
             'target': sequences.get('B', ''),
         }
 
-    def extract_metrics(self, structure_path: Path) -> dict:
-        """Extract folding metrics from the structure file."""
-        # Implement actual metric extraction logic here
-        # Placeholder implementation:
-        return {
-            "pLDDT": 85.0,
-            "i_PAE": 10.0,
-            "i_pTM": 0.8
-        }
-
 @app.cls(
     image=image,
     gpu="A10G",  # A10G should be sufficient for MSA generation
@@ -229,6 +219,8 @@ class MSAQuery:
             List of paths to generated MSA files
         """
         fasta_path = self.save_sequences_as_fasta.remote(sequences)
+        volume.commit()
+        volume.reload()
         out_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["msa_results"]
         out_dir.mkdir(parents=True, exist_ok=True)
         
@@ -585,6 +577,7 @@ def get_metrics_from_hash(seq_hash: str) -> dict:
                 'binder_hydrophobicity': sequence_indices['avg_hydrophobicity'],
                 'binder_hydropathy': sequence_indices['avg_hydropathy'],
                 'binder_solubility': sequence_indices['avg_solubility'],
+                'p_soluble': calculate_solubility(binder_seq)
             })
     
     return results
@@ -638,14 +631,19 @@ def update_metrics_for_all_folded(overwrite: bool = False):
     if all_metrics:
         df = pd.DataFrame(all_metrics)
         
-        # Check for missing sequence indices
-        sequence_index_columns = ['binder_hydrophobicity', 'binder_hydropathy', 'binder_solubility']
-        missing_indices = df[sequence_index_columns].isna().any(axis=1)
+        # Ensure all required columns exist
+        check_columns = ['binder_hydrophobicity', 'binder_hydropathy', 'binder_solubility', 'p_soluble']
+        for col in check_columns:
+            if col not in df.columns:
+                df[col] = pd.NA
+        
+        # Check for missing values
+        missing_indices = df[check_columns].isna().any(axis=1)
         
         if missing_indices.any():
-            logger.info(f"Found {missing_indices.sum()} rows with missing sequence indices")
+            logger.info(f"Found {missing_indices.sum()} rows with missing indices or p_soluble")
             
-            # Calculate missing indices
+            # Calculate missing indices and p_soluble
             for idx in df[missing_indices].index:
                 if 'binder_sequence' in df.columns and pd.notna(df.loc[idx, 'binder_sequence']):
                     sequence = df.loc[idx, 'binder_sequence']
@@ -654,8 +652,9 @@ def update_metrics_for_all_folded(overwrite: bool = False):
                     df.loc[idx, 'binder_hydrophobicity'] = indices['avg_hydrophobicity']
                     df.loc[idx, 'binder_hydropathy'] = indices['avg_hydropathy']
                     df.loc[idx, 'binder_solubility'] = indices['avg_solubility']
+                    df.loc[idx, 'p_soluble'] = calculate_solubility(sequence)
             
-            logger.info("Updated missing sequence indices")
+            logger.info("Updated missing indices and p_soluble values")
         
         # Save updated DataFrame
         df.to_csv(metrics_csv_path, index=False)
@@ -950,3 +949,216 @@ def calculate_sequence_indices(sequence: str) -> dict:
         'avg_hydropathy': total_hydropathy / valid_residues,
         'avg_solubility': total_solubility / valid_residues
     }
+
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def update_high_quality_metrics(overwrite: bool = False):
+    """Update metrics CSV with results from all high-quality folded structures."""
+    metrics_csv_path = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["high_quality_metrics_csv"]
+    top_ranked_csv_path = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["high_quality_top_ranked_csv"]
+    folded_dir = Path(MODAL_VOLUME_PATH) / OUTPUT_DIRS["folded_high_quality"]
+    
+    # Read existing metrics if file exists and not overwriting
+    existing_metrics = {}
+    if metrics_csv_path.exists() and not overwrite:
+        df = pd.read_csv(metrics_csv_path)
+        existing_metrics = df.to_dict('records')
+    
+    # Collect all metrics
+    all_metrics = []
+    score_files = list(folded_dir.glob("*_scores_rank_*.json"))
+    
+    for i, score_file in enumerate(score_files):
+        try:
+            # Extract parts from filename
+            # Format: hash_scores_rank_001_alphafold2_multimer_v3_model_5_seed_002.json
+            parts = score_file.stem.split('_')
+            seq_hash = parts[0]
+            rank = int(parts[3])
+            model_num = parts[8]  # Corrected index for model number
+            seed_num = parts[10]  # Corrected index for seed number
+            
+            # Skip if already processed and not overwriting
+            if not overwrite:
+                existing_metric = next((m for m in existing_metrics 
+                                      if m['seq_hash'] == seq_hash and m['rank'] == rank), None)
+                if existing_metric:
+                    all_metrics.append(existing_metric)
+                    continue
+
+            # Get corresponding PDB file
+            pdb_file = folded_dir / f"{seq_hash}_unrelaxed_rank_{rank:03d}_alphafold2_multimer_v3_model_{model_num}_seed_{seed_num}.pdb"
+            
+            if not pdb_file.exists():
+                logger.warning(f"Missing PDB file for {seq_hash} rank {rank}")
+                continue
+                
+            # Extract sequences from PDB
+            with open(pdb_file, 'r') as f:
+                pdb_content = f.read()
+                sequences = LocalColabFold.extract_sequence_from_pdb(pdb_content)
+            
+            binder_seq = sequences.get('binder', '')
+            target_seq = sequences.get('target', '')
+            binder_length = len(binder_seq)
+            
+            # Read scores
+            with open(score_file, 'r') as f:
+                scores_data = json.load(f)
+                
+            # Get PAE data
+            pae_file = folded_dir / f"{seq_hash}_predicted_aligned_error_v1.json"
+            pae_matrix = None
+            if pae_file.exists():
+                with open(pae_file, 'r') as f:
+                    pae_data = json.load(f)
+                    pae_matrix = np.array(pae_data.get('predicted_aligned_error', []))
+            
+            # Calculate metrics
+            metric = {
+                'seq_hash': seq_hash,
+                'rank': rank,
+                'model': model_num,  # Now using correct model number
+                'seed': seed_num,    # Now using correct seed number
+                'binder_sequence': binder_seq,
+                'target_sequence': target_seq,
+                'binder_length': binder_length,
+                'target_length': len(target_seq),
+                'plddt': np.mean(scores_data.get('plddt', [])),
+                'ptm': scores_data.get('ptm', 0),
+                'i_ptm': scores_data.get('iptm', 0),
+                'high_quality': True
+            }
+            
+            # Add sequence property metrics
+            sequence_indices = calculate_sequence_indices(binder_seq)
+            metric.update({
+                'binder_hydrophobicity': sequence_indices['avg_hydrophobicity'],
+                'binder_hydropathy': sequence_indices['avg_hydropathy'],
+                'binder_solubility': sequence_indices['avg_solubility']
+            })
+            
+            # Add PAE metrics if available
+            if pae_matrix is not None and pae_matrix.size > 0:
+                binder_pae = pae_matrix[:binder_length, :binder_length].mean()
+                target_pae = pae_matrix[binder_length:, binder_length:].mean()
+                interface_pae = (
+                    pae_matrix[:binder_length, binder_length:].mean() +
+                    pae_matrix[binder_length:, :binder_length].mean()
+                ) / 2
+                
+                metric.update({
+                    'binder_pae': binder_pae,
+                    'target_pae': target_pae,
+                    'pae_interaction': interface_pae
+                })
+            
+            all_metrics.append(metric)
+                
+        except Exception as e:
+            logger.error(f"Error processing {score_file}: {str(e)}")
+            
+        # Log progress every 10 files
+        if (i + 1) % 10 == 0:
+            logger.info(f"Processed {i + 1}/{len(score_files)} structures")
+    
+    # Convert to DataFrame and save all metrics
+    if all_metrics:
+        df_all = pd.DataFrame(all_metrics)
+        df_all.to_csv(metrics_csv_path, index=False)
+        logger.info(f"Updated high-quality metrics saved to {metrics_csv_path}")
+        
+        # Create top-ranked only DataFrame
+        df_top = df_all[df_all['rank'] == 1].copy()
+        df_top.to_csv(top_ranked_csv_path, index=False)
+        logger.info(f"Top-ranked metrics saved to {top_ranked_csv_path}")
+        
+        return df_all, df_top
+    else:
+        logger.warning("No metrics were collected")
+        return None, None
+    
+
+
+@app.function(
+    image=image,
+    timeout=9600,
+    volumes={MODAL_VOLUME_PATH: volume},
+)
+def parallel_fold_binder_high_quality(binder_seqs: List[str], target_seq: str=OFFICIAL_EGFR) -> List[dict]:
+    """Run complete high quality folding pipeline for multiple binder sequences in parallel.
+    
+    Args:
+        binder_seqs: List of binder sequences to fold
+        target_seq: Target sequence (defaults to official EGFR sequence)
+    
+    Returns:
+        List of dictionaries containing folding metrics for each sequence
+    """
+    logger.info(f"Starting parallel high quality folding pipeline for {len(binder_seqs)} sequences")
+    
+    # Use map to run fold_binder_high_quality in parallel for each sequence
+    results = list(fold_binder_high_quality.map(binder_seqs, [target_seq] * len(binder_seqs)))
+    
+    return results
+
+@app.local_entrypoint()
+def test_parallel_high_quality_fold():
+    """Test the parallel high quality folding functionality."""
+    test_seqs = [
+        'SYDGKCLNNGKCRYIEDLDSYTCQCESGYTGDRCQTRDLRWLELH',
+        'SYEGYCENRGTCQHIESLDSYTCKCLKGYTGDRCQSQDLRYLYLE',
+        'KYDGYCNNHGECQHIHSLDSYTCKCLPGYEGDRCQTQDLRWLELR',
+        'SYDGYCNNRGVCRHIESLDSYTCKCDQGYEGDRCQTRDLRWLELH',
+        'SYNGYCKNGGQCQHIISLDQYTCRCESGYEGDRCQTRDLRWLELR',
+        'SYDGYCLNRGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELR',
+        'SYDGYCNNRGVCRHIESLDTYTCQCKQGYEGDRCETRDLRWLELY',
+        'TYDGYCLNGGKCEHVESLDKYTCNCVSGYTGDRCQERDLRWLEHQ'
+    ]
+    test_seqs = [
+        'GYKGYCLNQGKCEHVESLDSYTCNCVSGYTGDRCQERDLRWLELR',
+        'GYKGYCLNQGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLELR',
+        'GYKGYCLNEGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLELR',
+        'GYKGYCLNEGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLEL',
+        'AYKGYCLNEGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLEL',
+        'AYKGYCLNEGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLELL',
+        'SYDGYCLNRGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELR',
+        'SYDGYCLNEGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELR',
+        'SYDGYCLNEGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELL',
+        'SYDGYCLNEGECRHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELL',
+        'SYEGYCLNEGECRHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELL',
+        'SYEGYCLNEGECRHIHSLDSYTCKCEPGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNEGECRHIHSLDSYTCKCEAGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNEGECRHVHSLDSYTCKCEAGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNEGECRHVKSLDSYTCKCEAGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNGGECRHVKSLDSYTCKCEAGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNGGECRHVKSLDTYTCKCEAGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNGGECRHVKSLDTYTCKCEAGYTGDRCQTRDLRYLELL',
+        'NLFSRCPKRYHGICENNGQCRYAINLRTYTCICDSGYTGDRCQELDIRYLLLLN',
+        'NLFSRCPKRYAGICENNGQCRYAINLRTYTCICDSGYTGDRCQELDIRYLLLLN',
+        'NLFSRCPKRYAGICENNGQCRYAINLRTYTCICKSGYTGDRCQELDIRYLLLLN',
+        'NLFSRCPKRYAGICENNGKCRYAINLRTYTCICKSGYTGDRCQELDIRYLLLLN',
+    ]
+    result = parallel_fold_binder_high_quality.remote(test_seqs)
+    print(f"Parallel high quality folding results: {result}")
+
+@app.local_entrypoint()
+def get_binder_msa():
+    """Get MSA for a binder sequence."""
+    binder_seqs = [
+        # 'SYEGYCENGGTCVHVEALDSYTCKCLKGYTGDRCQSQDLRYLLLE'
+        'RLFSRCPRRYHGICKNNGQCRYAINLRTYTCRCLSGYTGDRCEELDIRYLLLLY',
+        'RLFSRCPRRYHGICKNNGQCKYAINLRTYTCRCLSGYTGDRCEELDIRYLLLLY',
+    ]
+    result = get_msa_for_binder.remote(binder_seqs)
+    print(f"MSA for binder sequence: {result}")
+
+
+@app.local_entrypoint()
+def fhq(s: str):
+    """Fold a high quality binder sequence."""
+    result = fold_binder_high_quality.remote(s)
+    print(f"Folded high quality sequence: {result}")

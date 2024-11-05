@@ -5,6 +5,9 @@ from egfr_binder_rd2 import DATA_DIR
 from sklearn.model_selection import StratifiedShuffleSplit, train_test_split, GroupShuffleSplit
 import numpy as np
 import pandas as pd
+from egfr_binder_rd2.solubility import calculate_solubility
+from egfr_binder_rd2.fold import calc_percentage_charged, calc_percentage_hydrophobic
+
 
 def get_data():
     fp = 'https://raw.githubusercontent.com/adaptyvbio/egfr_competition_1/refs/heads/main/results/replicate_summary.csv'
@@ -16,6 +19,15 @@ def get_data():
     merged_df = dataset.table.merge(df, how='outer')
 
     merged_df['length'] = merged_df['sequence'].apply(len)
+
+    gdf = pd.read_csv('https://raw.githubusercontent.com/agitter/adaptyvbio-egfr/refs/heads/main/round1-second-submission-data.csv')
+    merged_df = pd.concat([merged_df, gdf.rename(columns={'expression': 'nc_adjusted_expression'})])
+    merged_df['encoded_expression'] = merged_df['nc_adjusted_expression'].map({'high': 3, 'medium': 2, 'low': 1, 'none': 0})
+    merged_df['perc_charged'] = merged_df['sequence'].apply(calc_percentage_charged)
+    merged_df['perc_hydrophobic'] = merged_df['sequence'].apply(calc_percentage_hydrophobic)
+    merged_df['p_soluble'] = merged_df['sequence'].apply(calculate_solubility)
+    merged_df['sequence'] = merged_df['sequence'].str.strip()
+    merged_df = merged_df.dropna(subset=['sequence'])
     return merged_df
 
 def get_data_with_scraped_expression():
@@ -37,7 +49,14 @@ def get_data_with_scraped_expression():
     
     return mdf
 
-
+def get_by_seq_data():
+    df = get_data()
+    cols = [
+        'length','sequence', 'username',
+        'encoded_expression', 'perc_charged', 'perc_hydrophobic',
+        'p_soluble'
+    ]
+    return df[cols].groupby(['username', 'sequence']).mean().reset_index()
 
 def create_data_splits_grouped(df, test_size=0.2, val_size=0.2, random_state=42):
 

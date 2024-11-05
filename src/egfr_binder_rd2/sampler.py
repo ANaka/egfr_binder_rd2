@@ -42,7 +42,12 @@ with image.imports():
 def safe_log_metrics(df: pd.DataFrame, metric_name: str, logger: logging.Logger) -> Dict[str, Any]:
     """Safely extract and log metrics, returning default values if columns don't exist."""
     try:
-        if metric_name == 'pae_interaction':
+        if metric_name == 'p_soluble':
+            mean = df['p_soluble_mean'].mean()
+            std = df['p_soluble_std'].mean()
+            ucb = df['p_soluble_ucb'].mean()
+            return {'mean': mean, 'std': std, 'ucb': ucb}
+        elif metric_name == 'pae_interaction':
             mean = df['pae_interaction_mean'].mean()
             std = df['pae_interaction_std'].mean()
             ucb = df['pae_interaction_ucb'].mean()
@@ -69,6 +74,75 @@ def safe_log_metrics(df: pd.DataFrame, metric_name: str, logger: logging.Logger)
     except KeyError as e:
         logger.error(f"Failed to extract {metric_name} metrics: {str(e)}")
         return {'mean': None, 'std': None, 'ucb': None}
+
+def format_sequence_info(row: pd.Series) -> str:
+    """Format sequence information with available metrics using fixed-width fields."""
+    try:
+        info_parts = []
+        
+        # Actual folding metrics (no suffix)
+        if 'pae_interaction' in row:
+            info_parts.append(f"iPAE={row['pae_interaction']:6.2f}")
+        if 'i_ptm' in row:
+            info_parts.append(f"iPTM={row['i_ptm']:5.2f}")
+        if 'binder_plddt' in row:
+            info_parts.append(f"pLDDT={row['binder_plddt']:6.2f}")
+        if 'p_soluble' in row:
+            info_parts.append(f"p_soluble={row['p_soluble']:5.2f}")
+            
+        # Predicted metrics from EvoProtGrad (_mean suffix)
+        if 'pae_interaction_mean' in row:
+            info_parts.append(f"pred_iPAE={row['pae_interaction_mean']:6.2f}")
+        if 'i_ptm_mean' in row:
+            info_parts.append(f"pred_iPTM={row['i_ptm_mean']:5.2f}")
+        if 'p_soluble_mean' in row:
+            info_parts.append(f"pred_p_soluble={row['p_soluble_mean']:5.2f}")
+            
+        # PLL metrics (no suffix as it comes from ESM)
+        if 'sequence_log_pll' in row:
+            info_parts.append(f"PLL={row['sequence_log_pll']:8.2f}")
+        
+        # Join all available metrics
+        metrics_str = " | ".join(info_parts)
+        
+        # Get sequence (handle both column names)
+        sequence = row.get('binder_sequence', row.get('sequence', 'UNKNOWN'))
+        
+        # Format with fixed-width fields
+        return f"Sequence: {sequence:<60} (len={len(sequence):<3}) | {metrics_str}"
+    except Exception as e:
+        logger.warning(f"Error formatting sequence info: {str(e)}")
+        sequence = row.get('binder_sequence', row.get('sequence', 'UNKNOWN'))
+        return f"Sequence: {sequence:<60} (len={len(sequence):<3})"
+
+def log_metrics_statistics(df: pd.DataFrame, logger: logging.Logger):
+    """Log available metrics statistics with fixed-width fields."""
+    logger.info("\nPredicted Metrics Statistics:")
+    
+    # Dictionary of metric names and their corresponding column prefixes
+    metrics = {
+        'iPAE': 'pae_interaction',
+        'iPTM': 'i_ptm',
+        'pLDDT': 'binder_plddt',
+        'p_soluble': 'p_soluble',
+        'PLL': 'sequence_log_pll'
+    }
+    
+    for metric_name, col_prefix in metrics.items():
+        try:
+            if f'{col_prefix}_mean' in df.columns:
+                mean = df[f'{col_prefix}_mean'].mean()
+                if f'{col_prefix}_std' in df.columns:
+                    std = df[f'{col_prefix}_std'].mean()
+                    logger.info(f"{metric_name:<8} (mean ± std): {mean:8.2f} ± {std:6.2f}")
+                else:
+                    logger.info(f"{metric_name:<8}: {mean:8.2f}")
+                
+                if f'{col_prefix}_ucb' in df.columns:
+                    ucb = df[f'{col_prefix}_ucb'].mean()
+                    logger.info(f"{metric_name:<8} UCB: {ucb:8.2f}")
+        except Exception as e:
+            logger.debug(f"Could not log {metric_name} metrics: {str(e)}")
 
 @app.cls(
     image=image,
@@ -138,12 +212,24 @@ class DirectedEvolution:
         retrain_frequency: int = 5,
         seed: int = 42,
         select_from_current_gen_only: bool = False,
+        include_solubility: bool = False,
         expert_configs: Optional[List[ExpertConfig]] = None,
     ):
         """Run multiple cycles of directed evolution with multiple parent sequences."""
         # Use default expert configs if none provided
         if expert_configs is None:
             expert_configs = DEFAULT_EXPERT_CONFIGS
+
+        # Log expert configurations
+        logger.info("\nExpert Configurations:")
+        for config in expert_configs:
+            logger.info(
+                f"Expert: {config.type.name:<8} | "
+                f"Temperature: {config.temperature:<6.3f} | "
+                f"Loss Type: {config.loss_type if hasattr(config, 'loss_type') else 'N/A':<4} | "
+                f"Explore Weight: {config.explore_weight if hasattr(config, 'explore_weight') else 'N/A'}"
+            )
+        logger.info("")  # Add blank line for readability
 
         current_parent_seqs = parent_binder_seqs.copy()
         all_final_sequences = []
@@ -240,35 +326,31 @@ class DirectedEvolution:
             # Log inference predictions before folding
             logger.info("\nInference Predictions for Selected Sequences:")
             logger.info(f"Number of sequences selected for folding: {len(selected_variants_df)}")
-            logger.info("\nPredicted Metrics Statistics:")
-            try:
-                pae_metrics = safe_log_metrics(selected_variants_df, 'pae_interaction', logger)
-                ptm_metrics = safe_log_metrics(selected_variants_df, 'i_ptm', logger)
-                plddt_metrics = safe_log_metrics(selected_variants_df, 'binder_plddt', logger)
-                pll_metrics = safe_log_metrics(selected_variants_df, 'sequence_log_pll_ucb', logger)
-
-                if pae_metrics['mean'] is not None:
-                    logger.info(f"iPAE (mean ± std): {pae_metrics['mean']:.2f} ± {pae_metrics['std']:.2f}")
-                    logger.info(f"iPAE UCB: {pae_metrics['ucb']:.2f}")
-                if ptm_metrics['mean'] is not None:
-                    logger.info(f"iPTM (mean ± std): {ptm_metrics['mean']:.2f} ± {ptm_metrics['std']:.2f}")
-                    logger.info(f"iPTM UCB: {ptm_metrics['ucb']:.2f}")
-                if plddt_metrics['mean'] is not None:
-                    logger.info(f"pLDDT (mean ± std): {plddt_metrics['mean']:.2f} ± {plddt_metrics['std']:.2f}")
-                if pll_metrics['mean'] is not None:
-                    logger.info(f"PLL: {pll_metrics['mean']:.2f}")
-            except Exception as e:
-                logger.error(f"Error logging metrics statistics: {str(e)}")
+            log_metrics_statistics(selected_variants_df, logger)
 
             # Log a few example sequences with their predictions
             for _, row in selected_variants_df.iterrows():
+                metrics_str = []
+                
+                # Add each metric if it exists with fixed width
+                if 'pae_interaction_mean' in row:
+                    metrics_str.append(f"bt iPAE={row['pae_interaction_mean']:6.2f} (UCB={row['pae_interaction_ucb']:6.2f})")
+                
+                if 'i_ptm_mean' in row:
+                    metrics_str.append(f"bt iPTM={row['i_ptm_mean']:5.2f} (UCB={row['i_ptm_ucb']:5.2f})")
+                
+                if 'binder_plddt_mean' in row:
+                    metrics_str.append(f"bt pLDDT={row['binder_plddt_mean']:6.2f}")
+                
+                if 'sequence_log_pll_mean' in row:
+                    metrics_str.append(f"bt PLL={row['sequence_log_pll_mean']:8.2f} (UCB={row['sequence_log_pll_ucb']:8.2f})")
+                
+                if 'p_soluble_mean' in row and 'p_soluble_ucb' in row:
+                    metrics_str.append(f"bt p_soluble={row['p_soluble_mean']:5.2f} (UCB={row['p_soluble_ucb']:5.2f})")
+                
                 logger.info(
-                   
-                    f"bt iPAE={row['pae_interaction_mean']:.2f} (UCB={row['pae_interaction_ucb']:.2f}), "
-                    f"bt iPTM={row['i_ptm_mean']:.2f} (UCB={row['i_ptm_ucb']:.2f}), "
-                    f"bt pLDDT={row['binder_plddt_mean']:.2f}, "
-                    f"bt PLL={row['sequence_log_pll_ucb']:.2f} "
-                    f"Sequence={row['sequence']} "
+                    f"{' | '.join(metrics_str)} | "
+                    f"Sequence={row['sequence']:<60}"
                 )
 
             # Save to CSV file with timestamp in name
@@ -388,12 +470,23 @@ class DirectedEvolution:
             ranking_df.loc[:, 'pae_interaction_rank'] = 1 - ranking_df['pae_interaction'].rank(pct=True)
             ranking_df.loc[:, 'i_ptm_rank'] = ranking_df['i_ptm'].rank(pct=True)
             ranking_df.loc[:, 'sequence_log_pll_rank'] = ranking_df['sequence_log_pll'].rank(pct=True)
-            ranking_df.loc[:, 'fitness'] = (
-                ranking_df['pae_interaction_rank'] + 
-                ranking_df['i_ptm_rank'] + 
-                ranking_df['sequence_log_pll_rank']
-            ) / 3
             
+            # Add p_soluble rank calculation
+            if include_solubility and 'p_soluble' in ranking_df.columns:
+                ranking_df.loc[:, 'p_soluble_rank'] = ranking_df['p_soluble'].rank(pct=True)
+                ranking_df.loc[:, 'fitness'] = (
+                    ranking_df['pae_interaction_rank'] + 
+                    ranking_df['i_ptm_rank'] + 
+                    ranking_df['sequence_log_pll_rank'] +
+                    ranking_df['p_soluble_rank']
+                ) / 4
+            else:
+                ranking_df.loc[:, 'fitness'] = (
+                    ranking_df['pae_interaction_rank'] + 
+                    ranking_df['i_ptm_rank'] + 
+                    ranking_df['sequence_log_pll_rank']
+                ) / 3
+
             # Sort by fitness
             ranking_df = ranking_df.sort_values('fitness', ascending=False).reset_index(drop=True)
             logger.info(f"Successfully ranked {len(ranking_df)} sequences")
@@ -418,20 +511,8 @@ class DirectedEvolution:
             # Log the top sequences with detailed metrics
             logger.info("\nTop sequences selected for generation:")
             for idx, row in top_sequences.iterrows():
-                logger.info(
-                    f"Sequence={row['binder_sequence']} "
-                    f"Sequence {idx + 1:03d}: "
-                    f"Length={len(row['binder_sequence'])}, "
-                    f"Fitness={row['fitness']:.3f} "
-                    f"(PLL_rank={row['sequence_log_pll_rank']:.3f}, "
-                    f"iPAE_rank={row['pae_interaction_rank']:.3f}, "
-                    f"iPTM_rank={row['i_ptm_rank']:.3f}), "
-                    f"Raw: PLL={row['sequence_log_pll']:.2f}, "
-                    f"iPAE={row['pae_interaction']:.2f}, "
-                    f"iPTM={row['i_ptm']:.2f}, "
-                    
-                )
-            
+                logger.info(format_sequence_info(row))
+
             # Select parents for next generation
             current_parent_seqs = self.select_multiple_parents_probabilistically(
                 top_sequences,
@@ -443,16 +524,7 @@ class DirectedEvolution:
             logger.info(f"\nSelected {len(current_parent_seqs)} parents for next generation:")
             for idx, parent in enumerate(current_parent_seqs, 1):
                 parent_metrics = top_sequences[top_sequences['binder_sequence'] == parent].iloc[0]
-                logger.info(
-                    f"Sequence={parent} "
-                    f"Parent {idx:03d}: "
-                    f"Length={len(parent)}, "
-                    f"PLL={parent_metrics['sequence_log_pll']:.2f}, "
-                    f"PAE={parent_metrics['pae_interaction']:.2f}, "
-                    f"iPTM={parent_metrics['i_ptm']:.2f}, "
-                    f"Fitness={parent_metrics['fitness']:.2f}, "
-                    
-                )
+                logger.info(format_sequence_info(parent_metrics))
             
             # Store top sequences for final return
             all_final_sequences.extend(top_sequences['binder_sequence'].tolist())
@@ -564,11 +636,22 @@ class DirectedEvolution:
             ranking_df.loc[:, 'pae_interaction_rank'] = 1 - ranking_df['pae_interaction'].rank(pct=True)
             ranking_df.loc[:, 'i_ptm_rank'] = ranking_df['i_ptm'].rank(pct=True)
             ranking_df.loc[:, 'sequence_log_pll_rank'] = ranking_df['sequence_log_pll'].rank(pct=True)
-            ranking_df.loc[:, 'fitness'] = (
-                ranking_df['pae_interaction_rank'] + 
-                ranking_df['i_ptm_rank'] + 
-                ranking_df['sequence_log_pll_rank']
-            ) / 3
+            
+            # Add p_soluble rank calculation
+            if include_solubility and 'p_soluble' in ranking_df.columns:
+                ranking_df.loc[:, 'p_soluble_rank'] = ranking_df['p_soluble'].rank(pct=True)
+                ranking_df.loc[:, 'fitness'] = (
+                    ranking_df['pae_interaction_rank'] + 
+                    ranking_df['i_ptm_rank'] + 
+                    ranking_df['sequence_log_pll_rank'] +
+                    ranking_df['p_soluble_rank']
+                ) / 4
+            else:
+                ranking_df.loc[:, 'fitness'] = (
+                    ranking_df['pae_interaction_rank'] + 
+                    ranking_df['i_ptm_rank'] + 
+                    ranking_df['sequence_log_pll_rank']
+                ) / 3
 
             # Sort by fitness
             ranking_df = ranking_df.sort_values('fitness', ascending=False).reset_index(drop=True)
@@ -618,16 +701,7 @@ class DirectedEvolution:
             logger.info(f"\nSelected {len(current_parent_seqs)} parents for next generation:")
             for idx, parent in enumerate(current_parent_seqs, 1):
                 parent_metrics = top_sequences[top_sequences['binder_sequence'] == parent].iloc[0]
-                logger.info(
-                    f"Sequence={parent} "
-                    f"Parent {idx:03d}: "
-                    f"Length={len(parent)}, "
-                    f"PLL={parent_metrics['sequence_log_pll']:.2f} (rank={parent_metrics['sequence_log_pll_rank']:.2f}), "
-                    f"PAE={parent_metrics['pae_interaction']:.2f} (rank={parent_metrics['pae_interaction_rank']:.2f}), "
-                    f"iPTM={parent_metrics['i_ptm']:.2f} (rank={parent_metrics['i_ptm_rank']:.2f}), "
-                    f"Fitness={parent_metrics['fitness']:.2f}, "
-                    
-                )
+                logger.info(format_sequence_info(parent_metrics))
             
             # Store top sequences for final return
             all_final_sequences.extend(top_sequences['binder_sequence'].tolist())
@@ -655,6 +729,39 @@ class DirectedEvolution:
             metadata.add_generation(gen, gen_metrics)
             os.makedirs(MODAL_VOLUME_PATH /OUTPUT_DIRS["evolution_trajectories"], exist_ok=True)
             metadata.save(MODAL_VOLUME_PATH /OUTPUT_DIRS["evolution_trajectories"])
+
+            # After folding and getting metrics, add this logging section:
+            logger.info("\nMetrics for all folded sequences in this generation (sorted by fitness):")
+            
+            # Calculate fitness for all sequences in current generation only
+            current_gen_df = combined_df[combined_df['binder_sequence'].isin(variant_seqs)].copy()
+            
+            # Calculate ranks and fitness
+            current_gen_df.loc[:, 'pae_interaction_rank'] = 1 - current_gen_df['pae_interaction'].rank(pct=True)
+            current_gen_df.loc[:, 'i_ptm_rank'] = current_gen_df['i_ptm'].rank(pct=True)
+            current_gen_df.loc[:, 'sequence_log_pll_rank'] = current_gen_df['sequence_log_pll'].rank(pct=True)
+            
+            if include_solubility and 'p_soluble' in current_gen_df.columns:
+                current_gen_df.loc[:, 'p_soluble_rank'] = current_gen_df['p_soluble'].rank(pct=True)
+                current_gen_df.loc[:, 'fitness'] = (
+                    current_gen_df['pae_interaction_rank'] + 
+                    current_gen_df['i_ptm_rank'] + 
+                    current_gen_df['sequence_log_pll_rank'] +
+                    current_gen_df['p_soluble_rank']
+                ) / 4
+            else:
+                current_gen_df.loc[:, 'fitness'] = (
+                    current_gen_df['pae_interaction_rank'] + 
+                    current_gen_df['i_ptm_rank'] + 
+                    current_gen_df['sequence_log_pll_rank']
+                ) / 3
+
+            # Sort by fitness and log each sequence
+            sorted_df = current_gen_df.sort_values('fitness', ascending=False)
+            for idx, row in sorted_df.iterrows():
+                logger.info(f"[{idx+1:03d}] Fitness={row['fitness']:.3f} | {format_sequence_info(row)}")
+
+            logger.info("\nGeneration Statistics:")
 
         logger.info("Directed evolution cycle completed.")
         # Save metadata
@@ -841,7 +948,7 @@ def main():
         'SLFSRCPRRYHGICGNNGQCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLLLN',
         'NLFSNCPRRYRGICNNNGSCQYAINLRTYTCQCSSGYTGARCQELDIRYLLLLY',
         'GLFSRCPKRYHGICGNNGQCRYAINLRTYTCRCVSGYTGPRCQELDIRYLLLLN',
-        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCSSGYTGARCQELDIRYLLLLY',
+        'NLFSNCPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY',
         'NLFSRCPKRYHGICENNGQCRYAINLRTYTCICDSGYTGDRCQELDIRYLLLLN',
         'SLFSRCPRRYHGICHNNGQCRYAINLRTYTCRCVSGYTGDRCQEKDIRYLLLLY',
         'NLFSICPRRYRGICTNNGSCRYAINLRTYTCQCVSGYTGARCQELDIRYLLLLY',
@@ -855,58 +962,6 @@ def main():
         'GLFSRCPKRYHGICGNNGQCRYAINLRTYTCRCVSGYTGDRCQELDIRYLLRLN',
         'SLFSKCPSKFHGICNNNGVCRYAINLRSYTCICLEGYTGDRCQEIDIRYLLLQL',
         'SLFSACPYRYHGICKNNGQCRYAISLRSGTCHCVSGYSGYRCHEIDIRYLLLRY'
-    ]
-    parent_binder_seqs = [
-        'AERMRRRFEHIVKIHEEWAKEVLENLKKQGSSEEDLKFMEEYLKQDVEELRERAEKMVEEYRKSS',
-        # 'AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS',
-        'SHMVEEALEIVKKLKEAGSDMKKIDELIEKLKEVFEKMPLEDVWPVLYEAEKAAFELMWNAEEGEEDVARAGNYLITKVWDLYFWLREREAARNAAAM',
-        'SKEEEYYEEHQKLAKPVEELWEKLDELEKTGKLTGEHRPLVTEFRRLWSDAMVLIAMYMWYLEEVDKNPSEENRKKAQEYLEKVEEKKKEMEELLKKL',
-        'SMEKEKLLEIVKELKEAGSDMEKIDELIEKMWEVMKKMELKDIWPVLYELEKVAFELMWNAEEGEEEVARAGNYLITKAWDLYFKAREAEAARNAALM',
-        'SSSLVPKAKEEAEDKIIEKIFEVQALSYIHVGETGDRKRHEEIHKKMHEIWEELQKFKKDPSVKTVEEVEKFEKELLEKLEKLKKSL',
-        'PVVPEPTMEDFEREFWELYAEYSKAYAEGTEEGLKKTRELRKKIMDVIGRQLEYIWNM',
-        'SLDDEITEKLREIVELSDEYALLHWRAKKLSGEEKKEVEEKMKEIKKKIDELWEEVGKLFDESMEKDEAAGKE',
-        # 'SLDDEITEKLREIVELSDEYALLHWRAKKLTGKEKEEVLKKMEEIKKRIDELWEEVGKLFDESMAKDEAAGKE',
-        'MPVPTPTMEDFEREFWKLYAEYSKAYAEGTEEGLAKTRELRKQIMDVIGRQLEYIWNM',
-        'MESIHEIVDKAAYEVIQTFIEKGASDEAKEEQTKIWDEAMAKINAIRAAA',
-        'APPLSEIEKEGQKVIAEIEKALTPVPEYHNRLTWENYQKAFVLEMEFFEKFPTEEAATVMSDFWSKFMKP',
-        'SMAEQKAEQEAKLAVWEAEMQADTDRMIADVMHRATPENAAEAQEVVDFLRLTRDEIIARRREIIEKKLAE',
-        # 'SMEEIRKEQKEKLEVWKKEMEKDTEKMINDVMHRATEENKEEAEEVVNFLRLTREEIIKRREEIIEKKLKE',
-        # 'SSLDEWLASLDPQVGQDIRDYIEERQAE',
-        'SSLDEWLASLDPQVGADIRAYIEERQAE',
-        'SEEKLAEIEAKLKEAAETLNVYEFFEVYSQIVVTTVLTREEYRRVDALSDKYFKKAPKRS',
-        # 'SEELLKEIEKKLKEAAKTLDVYEFFEVYSQIVVTTVLTREEYRRVDEISDKYFKEAPERS',
-        'MESIHEIVDKTAYEVIQTFIELGASEEAKEKQTKLWDEAMKKINEIRAKE',
-        'SEEELREQLREAVRPYIEDISQPMLEAIEALKREGDTELAEVMRKDEEEQIEKWTEMYVDILMKQL',
-        # 'TIREHHARQWARYQLEWLRDLVRDENLTDVDPEVLALIESDFTETVPAEELEAVIDELFKAVMDVIDKK',
-        # 'MKELKETIEKVRKEVEEMEKKVEEVIKDKSKLEEMMHELFYKASEAQFRVEMAKWRLVKQYGESVKEEVEEAEKVIEEVDEAFRKWWEKLESKM',
-        # 'EKEKVPKALEEAEDKIIEKIFEVQALSYIHVGETGDRELHEKIHEEMHEIWEELQKKKKDESIKTVEEVEKFEEELLKKLEELKESL',
-        # 'SMIKEEIEKVKKEWEEAKKKGVEGMMWVSFFNADWLLMYLKWKLKKRPELEPELKPLIEELEKLIKEIKEEIESL',
-        # 'MKIELSEEERQIVRDYVAKHAPWVSEKAIEAAIDAVLNAENFEEHQKYKEEAVKNGVDEDEFEVGMIVADPAVRWMAHPDPEMRQHYLHVFTP',
-        # 'MEELRKVMEEVKEEVKRLKEKVEEVIKDKEKLEEMMHELFYTASENQFRVEMAKWRLKKQYGESVKEEEEEAEKVIKEVDETFREYWEKLEKLM',
-        # 'PPVPEPFTEYRRWMRKLYEALDKYKYYEAKGDEKKAAEAKKEFEEVVANPPASMTDENVKAVVEEITAWQDVLGEAYKAAFTEE',
-        # 'MLSIDEILERMEEAVIRWAEEHPEKRHEMLKVAYSMRFMLRILYDENNGDLEKTFEEVEKIYAPKSEVAQEVLEVMREAIK',
-        # 'SAAEVHHLKRSKEYHLHFSNTVIDHMKKDGHTEDAKEMEAIKEKYLEEQEKKIKEAE',
-        # 'MLSIDELLEKMEEAVIKWAEEHPEVRHEALKTMYSIRFMFRIKYDENNGDFEKTFEEIKKIYEPKSEVAKEVLKVIEEAIK',
-        # 'SMEEFMKEWAKLQIEWYAEKAKGLPEGKKKHIFEITEQDLIWIARDLPELQEEIKKWVKEAEEK',
-        # 'EKEKELEKDYEDLKKVLWTGIEYEVRDEAYIEGRPDLPEEELKKRVEERVEKRVEEIRSMS',
-        # 'MRPKEVEELVPMYEKLLEKYKDDPWIVREIQADYYFHEAFIEYQVENGKEEEARRALEMFKKWVKEKYGEEFVE',
-        # 'MVPEEVLELRPVYEKLLEKYKDDPWIVREIQADYYFHEAFIEYQYENGKPEEARRALEMFKEWVRERYGEEFVP',
-        # 'MKIKLSEEEKQIVRDYVAKHAPWVSEKAIEAAIEAVLNAENFEEHQEFKKKAVEEGVDEDEFEVGMIVADPAVRWMAHPDPEMRQHYLHVFTP',
-        # 'MSPIEKEVLKDIEGAKEAIEKAKTTKDWEERFFMVYKMWSRLSYYRNDPEIMESLPEELQKKVEEEYERAYKEIWDISYQHIMDVVENG',
-        # 'MLSDREIMLEGLKMALEIFAPYMMQEYIEKIKEVVEEGIELVVKGVSFEEAREKAIEKVRNLPGVDEDTKIHLSFWVDSLLRYVYWYYQHYKR',
-        # 'MMSVEEWFERFKDPSADKEKVKAELEEAVKNKELSLNEVYELSVRIHMELYPRHKEYGLTKEEVRELFWFVNDLFFDMLIEGWTFEFK',
-        # 'SSEVEKLKEEFEEFLKEMEKYHHGDRETMEEALKRAEELAKRATELFQEAQKNNASDQDIHTLFYISTQMEHYAQWFKHML',
-        # 'MSEEQKKVLEYIEGAKKAIEEAKTIPNWEERFFLVYKMWSRLSYVRNNKELMESLPEELQKKVEEEYEKAYKEIWDISYQHIMDVVKNG',
-        # 'SLVDEYRAHMTEEEKKIFDRIVELLSKAFGKSKEEVEEFLVSLIPLMDNVGEQDKIAKGLLEKLTSAGALSEDEFWDLYYELQAVLLDVDRRMHRP',
-        # 'SMAEVHHLERSKEYHLHFSDTVIEHMRKDGHYEDAEEMEKIKKKYEEEMDKKIEEAK',
-        # 'SIQEKYDRLEKLHRDFMWKHHPSPNGPKEVLKMMKSEETKELYKKYYELWQRIENLFWKVLIEGEKVLDEAVPEMEKLIKEASEIKKKVEELYKKELEE',
-        # 'SMDELIEKVIEKYNITDEDEIWELRAWATPGFVRFVKEMAHERGKEKFLEEFKKTSRSKVEVMLVEEIVKQVP',
-        # 'SKEEEEKLIEFMKEFLKKLAEEEKAKLEAAGDKVTMREVFAIYWYRMFERALEELRKRGSTQYRYVLHKKFEEIVDEMIKEAE',
-        # 'RFSEEELELLERLAPEIPEVAEARERLERGEPIPAELLKKIAEALYNLPDSTKFTPEEHRELWRLYSNVVMDWHIAEADTPP',
-        # 'RFSEEELELLERLAPEIPEVAEMRRRMERGEPIPPELLKKIADALYNLPDSTKFTPEEHRELWRLYSNVVMDWHIAEADTPK',
-        # 'MPMSDEEKAKKMHIMIQHYYYEVQFMAWVLGLSKDSPEYKELMEPLKKMEELWEKFFEKGADTDKIYEEIKKVYEEGMAKANAFWEEKFNPK',
-        # 'MTVEEFVEKMMELYEHRYSTPSEIEAFRYHVMGVADIIYHHNNGKVPTIEEVERVLGLPPATPP',
-        # 'SAEEEREKQLKLLEEFKKEANELSVEFEKVMVDKHKETGKISQTEYQKKMSEFYDKIFTLHVEFAELLHNGAPEEEVLKFKEEALAELKQMVEDFKKE'
     ]
     parent_binder_seqs = [
         'AERMRRRFEHIVKIHEEWAKEVLENLKKQGSSEEDLKFMEEYLKQDVEELRERAEKMVEEYRKSS',
@@ -931,25 +986,139 @@ def main():
         'CPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRY',
         'PRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIR',
     ]
+    parent_binder_seqs = [
+        # 'DDEGKCHNQGVCEHAESLDKYTCRCKHGYTGDRCQTRDLRFLELN',
+        # 'REEEEESICPRRYRGICTNNGSCRYAINLRTYTCQCVSGYTGARCQELDIRYEEEER',
+        # 'NLFSRCPKRYHGICENNGQCRYAINLRTYTCICDSGYTGDRCQELDIRYLLLLN',
+        # 'GLFSICPRRYRGICTNNGSCRYAINLRTYTCQCVSGYTGARCQELDIRYLLLLY',
+        # 'EERSYDGYCNNHEECRQGYCGDRCQTRDLRWLELNEER'
+        'WVQLQESGGGLVQPGGSLRLSCAASGRTFSSYAMGWFRQAPGKQREFVAAIRWSGGYTYYTDSVKGRFTISRDNAKTTVYLQMNSLKPEDTAVYYCAATYLSSDYSRYALPQRPLDYDYWGQGTQVTVSSLE',
+    ]
+    parent_binder_seqs = [
+        # 'EKGHFKECPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRY',
+        # 'EKGHFKECPRRYRGICTNNGSCQYAINLRTYTCQCLSGYTGARCQELDIRYLLLLY'
+        # 'SYDGYCLNRGVCQHIESLDSYTCKCLPGYTGDRCQTQDLRWLELR',
+        # 'SYDGYCNNHGVCRHIESLDSWTCQCRQGYEGDRCQTRDLRWLELN',
+        # 'SYEGYCENRGTCQHIESLDSYTCKCLKGYTGDRCQSQDLRYLYLE',
+        'SYDGYCNNHGVCRHIESLDSWTCQCRQGYEGDRCQTRDLRWLELNEEREEREEREEREEREER'
+    ]
+    parent_binder_seqs = [
+        'PYDGYCLNGGVCMHIESLDKYTCECVIGYTGDRCQTRDLRWLELR',
+    ]
+    parent_binder_seqs = [
+        'SYDGYCLNRGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELRGGSGGSGGSSYDGYCLNRGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELR',
+    ]
+    parent_binder_seqs = [
+        'GYKGYCLNQGKCEHVESLDSYTCNCVSGYTGDRCQERDLRWLELR',
+        
+        'GYKGYCLNQGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLELR',
+        'GYKGYCLNEGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLELR',
+        'GYKGYCLNEGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLEL',
+        'AYKGYCLNEGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLEL',
+        'AYKGYCLNEGKCEHVESLDSYTCKCVSGYTGDRCQERDLRWLELL',
+        'SYDGYCLNRGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELR',
+        'SYDGYCLNEGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELR',
+        'SYDGYCLNEGECQHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELL',
+        'SYDGYCLNEGECRHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELL',
+        'SYEGYCLNEGECRHIHSLDSYTCKCEPGYTGDRCQTQDLRWLELL',
+        'SYEGYCLNEGECRHIHSLDSYTCKCEPGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNEGECRHIHSLDSYTCKCEAGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNEGECRHVHSLDSYTCKCEAGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNEGECRHVKSLDSYTCKCEAGYTGDRCQTRDLRWLELL',
+        'SYEGYCLNGGECRHVKSLDSYTCKCEAGYTGDRCQTRDLRWLELL',
+    ]
+    parent_binder_seqs = [
+        # 'NSDSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWELRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRNSDSECPLSHDGYCLHDGVCMYIEALDKYACNCVVGYIGERCQYRDLKWWELR'
+        'NSDSECPLSHDGYCLHDGVCMYIEALDKYACTCPVGYIGERCQYRDLKWWELHGGEGGEGGEGGEGGEGGPGGEGGRGGEGGRGGEGGRGGEGGERGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRCGEGGEGGRGGEGGEGGEGGEGGEGGRGGEGGRGGEGGRGGEGGRGGEGGEGGRNSDSECPLSHDGYCLHDGVCMYIEALTKYACNCPVGYIGERCQYRDLKWWELR',
+    ]
     evolution = DirectedEvolution()
     final_sequences = evolution.run_evolution_cycle.remote(
         parent_binder_seqs=parent_binder_seqs,
-        generations=30,
-        n_to_fold=50,                # Total sequences to fold per generation
-        num_parents=10,               # Number of parents to keep
+        generations=20,
+        n_to_fold=25,                # Total sequences to fold per generation
+        num_parents=5,               # Number of parents to keep
         top_k=200,                    # Top sequences to consider
-        n_parallel_chains=10,        # Parallel chains per sequence
+        n_parallel_chains=32,        # Parallel chains per sequence
         n_serial_chains=1,           # Sequential runs per sequence
         n_steps=50,                  # Steps per chain
-        max_mutations=5,             # Max mutations per sequence
-        evoprotgrad_top_fraction=0.25,
+        max_mutations=20,             # Max mutations per sequence
+        evoprotgrad_top_fraction=0.4,
         parent_selection_temperature=0.3,
         temp_cycle_period=5,  # Complete cycle every 5 generations
-        min_sampling_temp=0.3,  # Minimum temperature value
-        max_sampling_temp=2.0,  # Maximum temperature value
+        min_sampling_temp=0.1,  # Minimum temperature value
+        max_sampling_temp=1.,  # Maximum temperature value
         retrain_frequency=2,
         seed=42,
         select_from_current_gen_only=True,  # Add this parameter
+        include_solubility=True,  # New parameter
+        expert_configs=[
+            # ExpertConfig(
+            #     type=ExpertType.ESM, 
+            #     temperature=2.0,
+            #     model_name="facebook/esm2_t6_8M_UR50D",
+            #     # model_name='facebook/esm2_t33_650M_UR50D'
+            # ),
+            PartialEnsembleExpertConfig(
+                type=ExpertType.iPAE,
+                temperature=1,
+                make_negative=True,
+                transform_type="standardize",
+                num_heads=10,
+                dropout=0.15,
+                explore_weight=0.2,
+                loss_type='bt',  # Add explicit loss type
+            ),
+            PartialEnsembleExpertConfig(
+                type=ExpertType.iPTM,
+                temperature=10,
+                make_negative=False,
+                transform_type="standardize",
+                num_heads=10,
+                dropout=0.15,
+                explore_weight=0.2,
+                loss_type='bt',  # Add explicit loss type
+            ),
+            # PartialEnsembleExpertConfig(
+            #     type=ExpertType.pLDDT,
+            #     temperature=0.01,
+            #     make_negative=False,
+            #     transform_type="standardize",
+            #     num_heads=10,
+            #     dropout=0.15,
+            #     explore_weight=0.2,
+            #     loss_type='bt',  # Add explicit loss type
+            # ),
+            PartialEnsembleExpertConfig(
+                type=ExpertType.p_soluble,
+                temperature=1,
+                make_negative=False,
+                transform_type="standardize",
+                num_heads=3,
+                dropout=0.15,
+                explore_weight=0.,
+                loss_type='bt',  # Add explicit loss type
+            ),
+            PartialEnsembleExpertConfig(
+                type=ExpertType.PLL,
+                temperature=1,
+                make_negative=False,
+                transform_type="standardize",
+                num_heads=10,
+                dropout=0.15,
+                explore_weight=0.2,
+                loss_type='bt',  # Use MSE loss
+            ),
+            PartialEnsembleExpertConfig(
+                type=ExpertType.EXPRESSION,
+                temperature=1.0,
+                make_negative=False,
+                transform_type="standardize",
+                num_heads=3,
+                dropout=0.,
+                explore_weight=0.,
+                loss_type='bt',
+            ),
+        ]
     )
     
     print(f"Final evolved sequences: {final_sequences}")

@@ -112,18 +112,26 @@ def get_esm2_exact_pll(model, tokenizer, sequences: List[str], batch_size: int =
     """
     all_results = []
     model.eval();
+    logger.info(f"Processing {len(sequences)} sequences in batches of {batch_size}")
+    
     for i in range(0, len(sequences), batch_size):
         batch_sequences = sequences[i:i+batch_size]
+        logger.info(f"Processing batch {i//batch_size + 1}/{math.ceil(len(sequences)/batch_size)}")
         
-        for sequence in batch_sequences:
+        for sequence_idx, sequence in enumerate(batch_sequences):
+            logger.info(f"Processing sequence {sequence_idx + 1}/{len(batch_sequences)} in current batch")
             log_probs = []
             tokens = tokenizer(sequence, return_tensors="pt").to("cuda")
             input_ids = tokens["input_ids"].clone()
             attention_mask = tokens["attention_mask"].clone()
             seq_length = len(sequence)
             
+            logger.info(f"Calculating exact PLL by masking each position in sequence (length {seq_length})")
             # For each position in sequence
             for pos in range(seq_length):
+                if pos % 10 == 0:  # Log progress every 10 positions
+                    logger.debug(f"Processing position {pos + 1}/{seq_length}")
+                    
                 # Clone tokens and mask current position
                 correct_token_id = input_ids[0, pos + 1].clone()
                 masked_input_ids = input_ids.clone()
@@ -137,15 +145,20 @@ def get_esm2_exact_pll(model, tokenizer, sequences: List[str], batch_size: int =
                 log_prob = token_probs[0, pos + 1, correct_token_id].item()
                 log_probs.append(log_prob)
             
+            sequence_log_pll = math.fsum(log_probs)
+            normalized_log_pll = sequence_log_pll / seq_length
+            logger.info(f"Sequence {sequence_idx + 1} PLL: {sequence_log_pll:.2f}, normalized: {normalized_log_pll:.2f}")
+            
             result = {
                 "sequence": sequence,
                 "token_log_plls": log_probs,
-                "sequence_log_pll": math.fsum(log_probs),
-                "normalized_log_pll": math.fsum(log_probs) / seq_length,
+                "sequence_log_pll": sequence_log_pll,
+                "normalized_log_pll": normalized_log_pll,
                 "sequence_length": seq_length
             }
             all_results.append(result)
-    
+        
+    logger.info(f"Completed processing all {len(sequences)} sequences")
     return all_results
 
 @app.cls(
@@ -169,7 +182,58 @@ class ESM2Model:
 
     @modal.method()
     def predict_batch_exact(self, sequences: List[str], batch_size: int = 1):
-        return get_esm2_exact_pll(self.model, self.tokenizer, sequences, batch_size)
+
+        all_results = []
+        self.model.eval();
+        logger.info(f"Processing {len(sequences)} sequences in batches of {batch_size}")
+        
+        for i in range(0, len(sequences), batch_size):
+            batch_sequences = sequences[i:i+batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1}/{math.ceil(len(sequences)/batch_size)}")
+            
+            for sequence_idx, sequence in enumerate(batch_sequences):
+                logger.info(f"Processing sequence {sequence_idx + 1}/{len(batch_sequences)} in current batch")
+                log_probs = []
+                tokens = self.tokenizer(sequence, return_tensors="pt").to("cuda")
+                input_ids = tokens["input_ids"].clone()
+                attention_mask = tokens["attention_mask"].clone()
+                seq_length = len(sequence)
+                
+                logger.info(f"Calculating exact PLL by masking each position in sequence (length {seq_length})")
+                # For each position in sequence
+                for pos in range(seq_length):
+                    if pos % 10 == 0:  # Log progress every 10 positions
+                        logger.debug(f"Processing position {pos + 1}/{seq_length}")
+                        
+                    # Clone tokens and mask current position
+                    correct_token_id = input_ids[0, pos + 1].clone()
+                    masked_input_ids = input_ids.clone()
+                    masked_input_ids[0, pos + 1] = self.tokenizer.mask_token_id
+                    
+                    with torch.no_grad():
+                        logits = self.model(masked_input_ids, attention_mask=attention_mask).logits
+                        token_probs = torch.log_softmax(logits, dim=-1)
+                        
+                    # Get probability of correct token at masked position
+                    log_prob = token_probs[0, pos + 1, correct_token_id].item()
+                    log_probs.append(log_prob)
+                
+                sequence_log_pll = math.fsum(log_probs)
+                normalized_log_pll = sequence_log_pll / seq_length
+                logger.info(f"Sequence {sequence_idx + 1} PLL: {sequence_log_pll:.2f}, normalized: {normalized_log_pll:.2f}")
+                
+                result = {
+                    "sequence": sequence,
+                    "token_log_plls": log_probs,
+                    "sequence_log_pll": sequence_log_pll,
+                    "normalized_log_pll": normalized_log_pll,
+                    "sequence_length": seq_length
+                }
+                all_results.append(result)
+            
+        logger.info(f"Completed processing all {len(sequences)} sequences")
+
+        return all_results
 
 @app.function(image=image,
     timeout=9600,

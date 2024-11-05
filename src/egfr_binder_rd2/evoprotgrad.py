@@ -35,11 +35,11 @@ from egfr_binder_rd2 import (
     DEFAULT_EXPERT_CONFIGS,
 )
 from egfr_binder_rd2.datamodule import SequenceDataModule
-from egfr_binder_rd2.bt import BTRegressionModule, PartialEnsembleModule
+from egfr_binder_rd2.bt import BTRegressionModule, PartialEnsembleModule, PartialEnsembleModuleWithFeatures
 from egfr_binder_rd2.esm_regression_expert import EsmRegressionExpert
 from egfr_binder_rd2.esm2_pll import get_esm2_pll
 import logging
-from egfr_binder_rd2.utils import hash_seq
+from egfr_binder_rd2.utils import hash_seq, get_expression_model_path
 
 
 # Set up logging
@@ -89,6 +89,24 @@ def create_expert(config: ExpertConfig, device: str) -> Any:
             device=device,
             temperature=config.temperature,
         )
+    elif config.type == ExpertType.EXPRESSION:
+        try:
+            logger.info("Loading expression model")
+            model_path = get_expression_model_path()
+            model = PartialEnsembleModuleWithFeatures.load_model(model_path)
+            model.to(device)
+            model.eval()
+            
+            logger.info("Creating ESM regression expert for expression")
+            return EsmRegressionExpert(
+                temperature=config.temperature,
+                model=model,
+                tokenizer=model.tokenizer,
+                device=device,
+            )
+        except Exception as e:
+            logger.error(f"Failed to create expression expert: {str(e)}")
+            raise
     else:
         try:
             # Find latest adapter for this expert type
@@ -187,6 +205,7 @@ def train_bt_model(
     dropout: float = 0.1,  # New parameter for PartialEnsembleModule
     explore_weight: float = 0.2,  # New parameter for PartialEnsembleModule
     use_ensemble: bool = True,  # Flag to choose between BTRegressionModule and PartialEnsembleModule
+    loss_type: str = 'bt',  # Add loss_type parameter with default value
 ):
     """Train a Bradley-Terry regression model or ensemble on sequence data."""
     # Validate yvar is a supported type
@@ -262,6 +281,7 @@ def train_bt_model(
             xvar=xvar,
             dropout=dropout,
             explore_weight=explore_weight,
+            loss_type=loss_type,
         )
     else:
         model = BTRegressionModule(
@@ -413,10 +433,9 @@ def train_bt_model(
 )
 def train_experts_async():
     """Launch training tasks asynchronously without waiting."""
-    # Launch tasks using spawn() to avoid waiting for completion
     train_bt_model.remote(
         yvar="pae_interaction",
-        wandb_project="egfr-binder-rd2", 
+        wandb_project="egfr-binder-rd2-v1.0", 
         wandb_entity="anaka_personal",
         transform_type="standardize",
         make_negative=True,
@@ -426,11 +445,12 @@ def train_experts_async():
         dropout=0.15,
         explore_weight=0.2,
         max_epochs=20,
+        loss_type='bt',  # Add loss type
     )
     
     train_bt_model.remote(
         yvar="i_ptm",
-        wandb_project="egfr-binder-rd2",
+        wandb_project="egfr-binder-rd2-v1.0",
         wandb_entity="anaka_personal", 
         transform_type="standardize",
         make_negative=False,
@@ -440,38 +460,41 @@ def train_experts_async():
         dropout=0.15,
         explore_weight=0.2,
         max_epochs=20,
+        loss_type='bt',  # Add loss type
     )
     
+    # train_bt_model.remote(
+    #     yvar="binder_plddt",
+    #     wandb_project="egfr-binder-rd2",
+    #     wandb_entity="anaka_personal",
+    #     transform_type="standardize", 
+    #     make_negative=False,
+    #     seed=117,
+    #     use_ensemble=True,
+    #     num_heads=10,
+    #     dropout=0.15,
+    #     explore_weight=0.2,
+    #     max_epochs=20,
+    #     loss_type='bt',  # Add loss type
+    # )
     train_bt_model.remote(
-        yvar="binder_plddt",
-        wandb_project="egfr-binder-rd2",
+        yvar="p_soluble",
+        wandb_project="egfr-binder-rd2-v1.0",
         wandb_entity="anaka_personal",
         transform_type="standardize", 
         make_negative=False,
         seed=117,
         use_ensemble=True,
-        num_heads=10,
-        dropout=0.15,
-        explore_weight=0.2,
-        max_epochs=10,
-    )
-    train_bt_model.remote(
-        yvar="binder_hydropathy",
-        wandb_project="egfr-binder-rd2",
-        wandb_entity="anaka_personal",
-        transform_type="standardize", 
-        make_negative=True,
-        seed=117,
-        use_ensemble=True,
         num_heads=3,
         dropout=0.15,
         explore_weight=0.,
-        max_epochs=10,
+        max_epochs=6,
+        loss_type='bt',  # Add loss type
     )
 
     train_bt_model.remote(
         yvar="sequence_log_pll",
-        wandb_project="egfr-binder-rd2",
+        wandb_project="egfr-binder-rd2-v1.0",
         wandb_entity="anaka_personal",
         transform_type="standardize",
         make_negative=False,
@@ -480,7 +503,8 @@ def train_experts_async():
         num_heads=10,
         dropout=0.15,
         explore_weight=0.2,
-        max_epochs=10,
+        max_epochs=6,
+        loss_type='bt',  # Use MSE loss
     )
     
 
@@ -644,143 +668,69 @@ def sample_sequences(
     logger.info(f"Generated {len(df)} unique sequences across {total_chains} chains")
     return df
 
-@app.local_entrypoint()
-def main():
-    # Example usage with multiple experts
-    expert_configs = [
-        ExpertConfig(
-                type=ExpertType.ESM, 
-                temperature=1.0,
-            ),
-        PartialEnsembleExpertConfig(
-            type=ExpertType.iPAE,
-            temperature=1.0,
-            make_negative=True,
-            transform_type="standardize",
-        ),
-        PartialEnsembleExpertConfig(
-            type=ExpertType.iPTM,
-            temperature=1.0,
-            make_negative=False,
-            transform_type="standardize",
-        ),
-        PartialEnsembleExpertConfig(
-            type=ExpertType.pLDDT,
-            temperature=1.0,
-            make_negative=False,
-            transform_type="standardize",
-        ),
-        PartialEnsembleExpertConfig(
-            type=ExpertType.HYDROPATHY,
-            temperature=1.0,
-            make_negative=True,
-            transform_type="standardize",
-        ),
-        PartialEnsembleExpertConfig(
-            type=ExpertType.PLL,
-            temperature=1.0,
-            make_negative=False,
-            transform_type="standardize",
-        ),
-    ]
+# @app.local_entrypoint()
+# def main():
+    # # Example usage with multiple experts
+    # expert_configs = [
+    #     PartialEnsembleExpertConfig(
+    #         type=ExpertType.iPAE,
+    #         temperature=1.0,
+    #         make_negative=True,
+    #         transform_type="standardize",
+    #         num_heads=10,
+    #         dropout=0.15,
+    #         explore_weight=0.2,
+    #     ),
+    #     PartialEnsembleExpertConfig(
+    #         type=ExpertType.iPTM,
+    #         temperature=1.0,
+    #         make_negative=False,
+    #         transform_type="standardize",
+    #         num_heads=10,
+    #         dropout=0.15,
+    #         explore_weight=0.2,
+    #     ),
+    #     PartialEnsembleExpertConfig(
+    #         type=ExpertType.pLDDT,
+    #         temperature=1.0,
+    #         make_negative=False,
+    #         transform_type="standardize",
+    #         num_heads=10,
+    #         dropout=0.15,
+    #         explore_weight=0.2,
+    #     ),
+    #     PartialEnsembleExpertConfig(
+    #         type=ExpertType.p_soluble,
+    #         temperature=1.0,
+    #         make_negative=False,
+    #         transform_type="standardize",
+    #         num_heads=5,
+    #         dropout=0.,
+    #         explore_weight=0.,
+    #     ),
+    #     PartialEnsembleExpertConfig(
+    #         type=ExpertType.PLL,
+    #         temperature=1.0,
+    #         make_negative=False,
+    #         transform_type="standardize",
+    #         num_heads=10,
+    #         dropout=0.15,
+    #         explore_weight=0.2,
+    #     ),
+    # ]
     
-    sequences = sample_sequences.remote(
-        sequence="AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS",
-        expert_configs=expert_configs,
-        n_parallel_chains=32,           # Run 32 parallel chains
-        n_serial_chains=8,             # Run 8 times sequentially
-        n_steps=50,                    # 50 steps per chain
-        max_mutations=4,               # Max 4 mutations per sequence
-    )
-    print(f"Generated {len(sequences)} sequences")
+    # sequences = sample_sequences.remote(
+    #     sequence="AERMRRRFEHIVEIHEEWAKEVLENLKKQGSKEEDLKFMEEYLEQDVEELRKRAEEMVEEYEKSS",
+    #     expert_configs=expert_configs,
+    #     n_parallel_chains=32,           # Run 32 parallel chains
+    #     n_serial_chains=8,             # Run 8 times sequentially
+    #     n_steps=50,                    # 50 steps per chain
+    #     max_mutations=4,               # Max 4 mutations per sequence
+    # )
+    # print(f"Generated {len(sequences)} sequences")
+
 
 @app.local_entrypoint()
 def train():
-    train_bt_model.remote(
-        yvar="pae_interaction",
-        wandb_project="egfr-binder-rd2", 
-        wandb_entity="anaka_personal",
-        model_name="facebook/esm2_t6_8M_UR50D",
-        batch_size=32,
-        max_epochs=30,
-        learning_rate=1e-3,
-        peft_r=8,
-        peft_alpha=16,
-        max_length=512,
-        transform_type="standardize",
-        make_negative=True,
-        seed=117,
-        use_ensemble=True,
-        num_heads=10,
-        dropout=0.15,
-        explore_weight=0.2,
-    )
-    train_bt_model.remote(
-        yvar="i_ptm",
-        wandb_project="egfr-binder-rd2", 
-        wandb_entity="anaka_personal",
-        model_name="facebook/esm2_t6_8M_UR50D",
-        batch_size=32,
-        max_epochs=30,
-        learning_rate=1e-3,
-        peft_r=8,
-        peft_alpha=16,
-        max_length=512,
-        transform_type="standardize",
-        make_negative=False,
-        seed=117,
-        use_ensemble=True,
-        num_heads=10,
-        dropout=0.15,
-        explore_weight=0.2,
-    )
-    train_bt_model.remote(
-        yvar="binder_plddt",
-        wandb_project="egfr-binder-rd2", 
-        wandb_entity="anaka_personal",
-        batch_size=32,
-        max_epochs=30,
-        learning_rate=1e-3,
-        peft_r=8,
-        peft_alpha=16,
-        max_length=512,
-        transform_type="standardize",
-        make_negative=False,
-        seed=117,
-        use_ensemble=True,
-        num_heads=10,
-        dropout=0.15,
-        explore_weight=0.2,
-    )
-    train_bt_model.remote(
-        yvar="binder_hydropathy",
-        wandb_project="egfr-binder-rd2",
-        wandb_entity="anaka_personal",
-        transform_type="standardize", 
-        make_negative=True,
-        seed=117,
-        use_ensemble=True,
-        
-        num_heads=3,
-        dropout=0.15,
-        explore_weight=0.,
-    )
-    train_bt_model.remote(
-        yvar="sequence_log_pll",
-        wandb_project="egfr-binder-rd2",
-        wandb_entity="anaka_personal",
-        transform_type="standardize",
-        make_negative=False,
-        seed=117,
-        use_ensemble=True,
-        num_heads=10,
-        dropout=0.15,
-        explore_weight=0.2,
-        max_epochs=10,
-    )
-
-
-@app.local_entrypoint()
-def train_async():
     """Test just the training functionality."""
     results = train_experts_async.remote()

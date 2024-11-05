@@ -192,3 +192,45 @@ class SequenceDataModule(LightningDataModule):
             'val': self.val_indices,
             'test': self.test_indices
         }
+
+class SequenceFeaturesDataModule(SequenceDataModule):
+    """DataModule for sequence data with additional numerical features"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.numerical_features = [
+            'length',
+            'perc_charged',
+            'perc_hydrophobic',
+            'p_soluble'
+        ]
+        
+    def setup(self, stage: Optional[str] = None):
+        # Call parent setup to handle sequence tokenization
+        super().setup(stage)
+        
+        # Extract additional features for each split
+        for split_name, split_df in self.splits.items():
+            # Convert numerical features to tensor
+            features = torch.tensor(
+                split_df[self.numerical_features].values, 
+                dtype=torch.float32
+            )
+            
+            # Get corresponding dataset
+            dataset = getattr(self, f"{split_name}_dataset")
+            if dataset is not None:
+                # Remove sequence column if it exists
+                if 'sequence' in dataset.column_names:
+                    dataset = dataset.remove_columns('sequence')
+                
+                # Add features and sequence columns
+                dataset = dataset.add_column('numerical_features', features.tolist())
+                dataset = dataset.add_column('sequence', split_df[self.xvar].tolist())
+                
+                # Update format to include numerical features and sequence
+                columns = ["input_ids", "attention_mask", "numerical_features", self.yvar, "sequence"]
+                dataset.set_format(type="torch", columns=columns)
+                
+                # Update the dataset reference
+                setattr(self, f"{split_name}_dataset", dataset)

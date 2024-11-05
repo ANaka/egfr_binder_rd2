@@ -17,12 +17,14 @@ OUTPUT_DIRS = {
     "lineage_csv": Path("lineage.csv"),
     "esm2_pll_results": Path("esm2_pll_results/"),
     "esm2_pll_results_exact": Path("esm2_pll_results_exact/"),
+    "esm2_exact_pll_metrics": Path("esm2_exact_pll_metrics.csv"),
     "bt_models": Path("bt_models/"),
     "rd1_fold_df": Path("rd1_fold_df.csv"),
     "evolution_trajectories": Path("evolution_trajectories/"),
     "inference_results": Path("inference_results/"),
     "folded_high_quality": Path("folded_high_quality/"),
-    "esm2_exact_pll_metrics": Path("esm2_exact_pll_metrics.csv"),
+    "high_quality_metrics_csv": Path("high_quality_metrics.csv"),
+    "high_quality_top_ranked_csv": Path("high_quality_top_ranked.csv"),
 }
 
 LOGGING_CONFIG = {
@@ -64,6 +66,8 @@ class ExpertType(enum.Enum):
     pLDDT = "binder_plddt"
     HYDROPATHY = "binder_hydropathy"
     PLL = "sequence_log_pll"
+    p_soluble = "p_soluble"
+    EXPRESSION = "expression"
     
     @classmethod
     def from_str(cls, label: str) -> 'ExpertType':
@@ -83,7 +87,8 @@ class PartialEnsembleExpertConfig(ExpertConfig):
     num_heads: int = 10
     dropout: float = 0.1
     explore_weight: float = 0.2
-
+    loss_type: str = 'bt'
+    
 @dataclass
 class EvolutionMetadata:
     """Metadata for tracking evolution progress"""
@@ -116,12 +121,6 @@ class EvolutionMetadata:
 
 # Add new default expert configurations
 DEFAULT_EXPERT_CONFIGS = [
-    # ExpertConfig(
-    #     type=ExpertType.ESM, 
-    #     temperature=2.0,
-    #     model_name="facebook/esm2_t6_8M_UR50D",
-    #     # model_name='facebook/esm2_t33_650M_UR50D'
-    # ),
     PartialEnsembleExpertConfig(
         type=ExpertType.iPAE,
         temperature=1.0,
@@ -130,6 +129,7 @@ DEFAULT_EXPERT_CONFIGS = [
         num_heads=10,
         dropout=0.15,
         explore_weight=0.2,
+        loss_type='bt',
     ),
     PartialEnsembleExpertConfig(
         type=ExpertType.iPTM,
@@ -139,6 +139,7 @@ DEFAULT_EXPERT_CONFIGS = [
         num_heads=10,
         dropout=0.15,
         explore_weight=0.2,
+        loss_type='bt',
     ),
     PartialEnsembleExpertConfig(
         type=ExpertType.pLDDT,
@@ -148,15 +149,17 @@ DEFAULT_EXPERT_CONFIGS = [
         num_heads=10,
         dropout=0.15,
         explore_weight=0.2,
+        loss_type='bt',
     ),
     PartialEnsembleExpertConfig(
-        type=ExpertType.HYDROPATHY,
+        type=ExpertType.p_soluble,
         temperature=1.0,
-        make_negative=True,
+        make_negative=False,
         transform_type="standardize",
-        num_heads=3,
-        dropout=0.1,
+        num_heads=5,
+        dropout=0.,
         explore_weight=0.,
+        loss_type='mse',
     ),
     PartialEnsembleExpertConfig(
         type=ExpertType.PLL,
@@ -166,5 +169,16 @@ DEFAULT_EXPERT_CONFIGS = [
         num_heads=10,
         dropout=0.15,
         explore_weight=0.2,
+        loss_type='mse',
+    ),
+    PartialEnsembleExpertConfig(
+        type=ExpertType.EXPRESSION,
+        temperature=1.0,
+        make_negative=False,
+        transform_type="standardize",
+        num_heads=3,
+        dropout=0.,
+        explore_weight=0.,
+        loss_type='bt',
     ),
 ]
