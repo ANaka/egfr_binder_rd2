@@ -1,0 +1,11 @@
+I built on the approach I used in round 1 - active learning to distill the colabfold oracle. This time I LORA'd the 8M version of ESM2. I trained these to predict the pae_interaction, i_ptm, and pLDDT scores coming back from colabfold runs predicting the structure of binder:EGFR complexes, and retrained as I tried more sequences. I did the same thing for the 650M ESM2 log-likelihood which seemed reasonably accurate and was much faster to evaluate. I also trained an offline model to predict expression using an 8M ESM2 stem with a few other features concatentated in (fingers crossed this works since that really bit me last time). I used the partial-ensembling approach from this paper (https://arxiv.org/pdf/2305.20009) to provide uncertainty estimates for the predictions of these models.
+
+To propose new sequences I sampled using EvoProtGrad, using the upper confidence bounds of the predictions of the models as guidance. I the same models to estimate the fitness of the sequences, then filtered and sampled using these fitness estimates to select a set of sequences to fold. I extracted metrics from the structure predictions and used these to score the "true" fitness of the sequences, then filtered/sampled again to get a new set of seed sequences for the next round of diversification.
+
+As with last time, I focused on optimizing EGF. I also tried to use this approach to refine outputs from Bindcraft, but got pretty mixed results - generally seemed like the original bindcraft sequences were better. This might be to lack of MSA coverage. Another possible reason - I tried this after I had already accumulated a pretty large dataset of EGF-derived sequences and there might have been a domain mismatch issue.
+
+Some other oddities in here: 
+- I put two identical binders on a long linker to see what would happen.
+- Tried making a pretty small binder to see if this approach would work for that, ran out of time to see how much I could optimize it though. 
+
+Many thanks to Modal for the compute credits!
